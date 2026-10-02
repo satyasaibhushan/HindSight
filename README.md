@@ -10,8 +10,14 @@ Categories (`category`, required): `instructions`, `skills`, `codebase`, `collab
 plus the retained `connector`, `tooling`, `environment`, `documentation`, `workflow`, `performance`,
 `other`. The set is additive; existing rows and clients stay valid. Any other value is rejected.
 
-- `/review` — reviewers (Google sign-in, email allowlist) read their own feedback and set review state.
-- `/tokens` — reviewers create, list, and revoke ingestion tokens (scope `feedback:submit`, 1–90 day expiry).
+- `/auth/signin`, `/auth/signout` — HindSight's own sign-in ("Continue with Google") and sign-out screens.
+  Their forms POST to Auth.js with the CSRF token Auth.js issued; Auth.js errors (e.g. a non-allowlisted
+  account) redirect back to the sign-in screen with a readable message.
+- `/review` (Inbox) — reviewers (Google sign-in, email allowlist) read their own feedback, filter by state,
+  category, and API key, and set review state with one click.
+- `/tokens` (API keys) — reviewers create, list, and revoke ingestion tokens (scope `feedback:submit`, 7/30/60/90
+  day expiry). A key has only a **name**; that name is stored as the token's client label, which attributes
+  and idempotency-binds its submissions (the `client` column is kept, so existing tokens and rows are unchanged).
   The list is newest first, 50 per page, using a keyset cursor `?before=<token id>` (the last id on the
   previous page). The cursor is resolved only among the signed-in owner's tokens, so every token,
   including the oldest, is reachable and revocable, and a foreign or unknown id yields an empty page.
@@ -20,12 +26,17 @@ plus the retained `connector`, `tooling`, `environment`, `documentation`, `workf
   The token's owner must still be listed in `HINDSIGHT_REVIEWER_EMAILS`. Removing an owner disables
   their tokens at once: requests get the same `401 invalid_token` as an unknown token, before any
   throttle or submission.
+- `/connect` — copyable MCP setup for Claude Code, Codex CLI, Cursor, and OpenCode, filled in with this origin.
 - `/health` — reports `ok` or `setup-required`; no secrets.
 
-All pages send `Content-Security-Policy` with `form-action 'self'`. The one exception is the sign-in
-page (`/auth/signin`), which also allows `https://accounts.google.com` so its Google redirect can complete.
+All pages send `Content-Security-Policy` with `default-src 'none'` and `form-action 'self'`. The one exception
+is the sign-in page (`/auth/signin`), which also allows `https://accounts.google.com` so its Google redirect
+can complete. The only script is one small inline progressive-enhancement script (copy buttons, revoke
+confirmation, filter auto-submit), allowed by its SHA-256 hash; every page works without it. Icons and the
+Google logo are inline SVG, so nothing external is loaded. (Auth.js's built-in sign-in page loaded its Google
+logo from `authjs.dev`, which this CSP blocked, leaving a broken image in the button.)
 
-Feedback is attributable to the owner, token, and client that submitted it. It is **not anonymous**.
+Feedback is attributable to the owner and the API key (token name) that submitted it. It is **not anonymous**.
 Do not submit secrets, transcripts, or provider-private prompts or policies; obvious secret patterns
 are rejected. Submit best effort at final handoff, skip generic or no-op notes, and reuse a
 `request_id` only to retry the identical submission (see `docs/agent-feedback.md`).
@@ -110,7 +121,7 @@ applying. Use a database role limited to the HindSight tables where possible.
 
 ## MCP client setup (manual, ingestion-only)
 
-Create a token at `/tokens`, then store the raw token (`hs_…`) in the dedicated environment
+Create an API key at `/tokens` (the `/connect` screen has copyable versions of the snippets below), then store the raw token (`hs_…`) in the dedicated environment
 variable `HINDSIGHT_INGEST_TOKEN`. Never embed real tokens in checked-in configs; nothing here is
 installed automatically. Leave client tool-approval defaults as they are. OAuth onboarding for
 machines is deferred. Shapes below follow official docs as of 2026-10-01; they have not been

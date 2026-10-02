@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { csrfToken, hashToken, isAuthorizedReviewer } from '../src/security.js';
+import { SCRIPT_HASH } from '../src/ui.js';
+import { createHash } from 'node:crypto';
 import { ORIGIN, SECRET, call, env, serve, text } from './helpers.js';
 
 const TOKEN = 'hs_' + 'A'.repeat(43);
@@ -53,8 +55,8 @@ function authSpy() {
 
 const reviewer = async () => ({ email: OWNER });
 const anonymous = async () => null;
-const app = (store, { getReviewer = reviewer, config = loadConfig(env), authRouter = authSpy().router } = {}) =>
-  createApp({ config, store, getReviewer, authRouter });
+const app = (store, { getReviewer = reviewer, config = loadConfig(env), authRouter = authSpy().router, getAuthCsrf } = {}) =>
+  createApp({ config, store, getReviewer, authRouter, getAuthCsrf });
 
 test('empty configuration exposes only the setup-required shell', async () => {
   const config = loadConfig({});
@@ -296,7 +298,7 @@ test('token whose owner was removed from reviewers is rejected before throttle o
 
 test('only the sign-in page may submit forms to the exact Google authorization origin', async () => {
   const policy = (formAction) =>
-    `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
+    `default-src 'none'; script-src ${SCRIPT_HASH}; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
   await serve(app(fakeStore()), async (base) => {
     for (const path of ['/auth/signin', '/auth/signin?callbackUrl=%2Freview']) {
       assert.equal((await call(base, path)).headers['content-security-policy'], policy("'self' https://accounts.google.com"));
@@ -335,7 +337,7 @@ test('oversized MCP body is rejected', async () => {
   });
 });
 
-test('long unbroken metadata and token text wrap inside their flex containers', async () => {
+test('long unbroken metadata and key names wrap inside their containers', async () => {
   const repository = 'r'.repeat(300);
   const task = 't'.repeat(300);
   const source = 's'.repeat(300);
@@ -352,19 +354,136 @@ test('long unbroken metadata and token text wrap inside their flex containers', 
     const review = text(await call(base, '/review'));
     const tokens = text(await call(base, '/tokens'));
     // Complete values stay rendered (no truncation) in the wrapped containers.
-    for (const v of [`Repository: ${repository}`, `Task: ${task}`, `Source: ${source}`, `<li>${client}</li>`]) {
+    for (const v of [`<dt>Repository</dt><dd>${repository}</dd>`, `<dt>Task</dt><dd>${task}</dd>`,
+      `<dt>Source</dt><dd>${source}</dd>`, `</svg>${client}</span>`]) {
       assert.ok(review.includes(v), v.slice(0, 20));
     }
-    assert.ok(tokens.includes(`<li><div><b>${name}</b> <span class="note">${client}</span>`));
+    assert.ok(tokens.includes(`<b>${name}</b>`));
     for (const css of [styleOf(review), styleOf(tokens)]) {
-      for (const selector of ['.meta>li', 'ul.plain li>div']) {
+      for (const selector of ['.ctx dd', '.keys .name b', '.fb-top .src']) {
         const decl = rule(css, selector);
         assert.match(decl, /(?:^|;)min-width:0(?:;|$)/, selector);
         assert.match(decl, /(?:^|;)overflow-wrap:anywhere(?:;|$)/, selector);
         assert.doesNotMatch(decl, /overflow:hidden|text-overflow|white-space:nowrap/, selector);
       }
-      assert.match(rule(css, '.meta'), /flex-wrap:wrap/);
-      assert.match(rule(css, 'ul.plain li'), /flex-wrap:wrap/);
+      assert.match(rule(css, '.ctx'), /flex-wrap:wrap/);
+      assert.match(rule(css, '.fb-top'), /flex-wrap:wrap/);
+    }
+  });
+});
+
+const CSRF_COOKIE = '__Host-authjs.csrf-token=abc%7Cdef; Path=/; HttpOnly; Secure; SameSite=Lax';
+const authCsrf = async () => ({ csrfToken: 'auth-csrf-"1', cookies: [CSRF_COOKIE] });
+
+test('sign-in screen posts to Auth.js Google sign-in with its CSRF token and no external assets', async () => {
+  const spy = authSpy();
+  await serve(app(fakeStore(), { getReviewer: anonymous, authRouter: spy.router, getAuthCsrf: authCsrf }), async (base) => {
+    const res = await call(base, '/auth/signin?callbackUrl=%2Ftokens');
+    const html = text(res);
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.headers['set-cookie'], [CSRF_COOKIE]);
+    assert.match(html, /<form method="post" action="\/auth\/signin\/google">/);
+    assert.ok(html.includes('name="csrfToken" value="auth-csrf-&quot;1"'));
+    assert.ok(html.includes('name="callbackUrl" value="/tokens"'));
+    assert.match(html, /Continue with Google/);
+    assert.doesNotMatch(html, /<img|https?:\/\/(?!www\.w3\.org)/); // logo is inline SVG; nothing the CSP would block
+    // Unsafe or self-referential callbacks fall back to the inbox; same-origin absolute URLs are reduced.
+    for (const [cb, want] of [['%2F%2Fevil.test', '/review'], ['https%3A%2F%2Fevil.test%2Fx', '/review'],
+      ['%2Fauth%2Fsignin', '/review'], [encodeURIComponent(ORIGIN + '/tokens?x=1'), '/tokens?x=1']]) {
+      assert.ok(text(await call(base, '/auth/signin?callbackUrl=' + cb)).includes(`name="callbackUrl" value="${want}"`), cb);
+    }
+    const denied = await call(base, '/auth/signin?error=AccessDenied');
+    assert.equal(denied.status, 401);
+    assert.match(text(denied), /not on the reviewer allow-list/);
+    assert.match(text(await call(base, '/auth/signin?error=%3Cscript%3E')), /Sign-in did not complete/);
+    assert.match(text(await call(base, '/auth/signin?signedOut=1')), /signed out/);
+  });
+  assert.deepEqual(spy.seen, []); // GET /auth/signin is ours; Auth.js still handles the POST
+  await serve(app(fakeStore(), { getAuthCsrf: authCsrf }), async (base) => {
+    const res = await call(base, '/auth/signin?callbackUrl=%2Ftokens');
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.location, '/tokens');
+  });
+});
+
+test('sign-out screen confirms with an Auth.js CSRF form', async () => {
+  await serve(app(fakeStore(), { getAuthCsrf: authCsrf }), async (base) => {
+    const html = text(await call(base, '/auth/signout'));
+    assert.match(html, /<form class="solo-actions" method="post" action="\/auth\/signout">/);
+    assert.ok(html.includes('name="csrfToken" value="auth-csrf-&quot;1"'));
+    assert.ok(html.includes(OWNER));
+  });
+  await serve(app(fakeStore(), { getReviewer: anonymous, getAuthCsrf: authCsrf }), async (base) => {
+    const res = await call(base, '/auth/signout');
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.location, '/auth/signin?signedOut=1');
+  });
+});
+
+test('API keys have only a name; it becomes the stored client label', async () => {
+  const store = fakeStore();
+  const csrf = csrfToken(SECRET, OWNER);
+  await serve(app(store), async (base) => {
+    const page = text(await call(base, '/tokens'));
+    assert.ok(page.includes('name="name"'));
+    assert.ok(!page.includes('name="client"'));
+    const ok = await post(base, '/tokens', { name: '  Work laptop  ', days: '60', csrf });
+    const html = text(ok);
+    assert.equal(ok.status, 200);
+    const secret = html.match(/<code id="new-secret">(hs_[A-Za-z0-9_-]{43})<\/code>/)[1];
+    assert.ok(html.includes('data-copy="new-secret"'));
+    assert.ok(html.includes(`export HINDSIGHT_INGEST_TOKEN="${secret}"`));
+    assert.equal(store.created[0].tokenHash, hashToken(secret));
+    for (const bad of [{ name: '' }, { name: 'x'.repeat(81) }, { name: 'n', days: '91' }, { name: 'n', days: '1.5' }]) {
+      assert.equal((await post(base, '/tokens', { days: '7', ...bad, csrf })).status, 400);
+    }
+    const revoked = await post(base, `/tokens/${ID}/revoke`, { csrf });
+    assert.equal(revoked.status, 303);
+    assert.equal(revoked.headers.location, '/tokens?revoked=1');
+    assert.match(text(await call(base, '/tokens?revoked=1')), /API key revoked/);
+  });
+  assert.equal(store.created.length, 1);
+  assert.equal(store.created[0].name, 'Work laptop');
+  assert.equal(store.created[0].client, 'Work laptop');
+  assert.equal(Math.round((store.created[0].expiresAt - Date.now()) / 86400000), 60);
+});
+
+test('review state change returns to the same filtered view, and only to /review', async () => {
+  const csrf = csrfToken(SECRET, OWNER);
+  await serve(app(fakeStore()), async (base) => {
+    const html = text(await call(base, '/review?state=new&category=skills'));
+    assert.ok(html.includes('name="next" value="/review?category=skills&amp;state=new"'));
+    assert.ok(html.includes('<button name="state" value="new" aria-pressed="true">'));
+    const back = await post(base, `/review/${ID}/state`, { state: 'triaged', csrf, next: '/review?category=skills&state=new' });
+    assert.equal(back.headers.location, `/review?category=skills&state=new#fb-${ID}`);
+    for (const next of ['https://evil.test/review', '//evil.test', '/tokens', '/review/../tokens', '/review?x=<b>']) {
+      const res = await post(base, `/review/${ID}/state`, { state: 'triaged', csrf, next });
+      assert.equal(res.headers.location, `/review#fb-${ID}`, next);
+    }
+  });
+});
+
+test('connect screen shows copyable client setup for the canonical endpoint', async () => {
+  await serve(app(fakeStore(), { getReviewer: anonymous }), async (base) => {
+    assert.equal((await call(base, '/connect')).status, 303);
+  });
+  await serve(app(fakeStore()), async (base) => {
+    const html = text(await call(base, '/connect'));
+    assert.ok(html.includes(`<code id="c-url" class="small">${ORIGIN}/api/mcp</code>`));
+    for (const id of ['c-claude', 'c-codex', 'c-cursor', 'c-opencode', 'c-env', 'c-url']) assert.ok(html.includes(`data-copy="${id}"`), id);
+    assert.ok(html.includes('--header &#39;Authorization: Bearer ${HINDSIGHT_INGEST_TOKEN}&#39;'));
+    assert.doesNotMatch(html, /hs_[A-Za-z0-9_-]{43}/);
+  });
+});
+
+test('the inline script on every page matches the CSP hash', async () => {
+  await serve(app(fakeStore(), { getAuthCsrf: authCsrf }), async (base) => {
+    for (const path of ['/review', '/tokens', '/connect', '/auth/signout']) {
+      const res = await call(base, path);
+      const scripts = [...text(res).matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+      assert.equal(scripts.length, 1, path);
+      const hash = `'sha256-${createHash('sha256').update(scripts[0]).digest('base64')}'`;
+      assert.ok(res.headers['content-security-policy'].includes(`script-src ${hash};`), path);
     }
   });
 });
