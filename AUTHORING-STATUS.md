@@ -59,6 +59,22 @@ and collaboration, as well as tools and connectors.
   must be truthful, never include provider-private prompts or policies, and that a `request_id` is
   reused only for identical retries.
 
+## UI/UX overhaul (authored; tested locally in this session)
+
+- New shared UI module `src/ui.js`: design tokens with light/dark themes, an app shell with Inbox / API keys / Connect
+  navigation, inline SVG icons, and one inline script pinned by a CSP `script-src` hash (copy buttons, revoke
+  confirmation, filter auto-submit; everything works without it).
+- New screens: custom sign-in (fixes the Google button, whose logo the CSP blocked), sign-out confirmation, Connect
+  (copyable per-client MCP setup), restyled setup-required and error screens.
+- Inbox: state tabs, category and API-key filters, two-column friction/improvement cards, one-click review state that
+  returns to the same filtered view, and a copyable request id.
+- API keys: name only (no client field; the name is stored as the client label, with no schema change), preset
+  expiry, a table with status/created/last used/expiry, a one-time reveal with copy buttons and an env-var snippet,
+  and revoke with confirmation plus a flash message.
+- `npm run check` and `npm test` (55 tests, DB tests not run) passed locally. A headless Chromium click on "Continue
+  with Google" was redirected to `accounts.google.com` with the canonical `redirect_uri`. A real Google round trip is
+  still untested.
+
 ## Operator-run diagnostics (reported to the author, not run by the author)
 
 - slice004: clean install, syntax check, 41 tests, and `npm audit` (0) passed. Manual checks on isolated
