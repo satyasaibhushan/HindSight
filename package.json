@@ -1,0 +1,24 @@
+{
+  "name": "hindsight",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node scripts/dev.js",
+    "dev": "node --env-file-if-exists=.env --watch scripts/dev.js",
+    "migrate": "node --env-file-if-exists=.env scripts/migrate.js",
+    "check": "node --check api/index.js && node --check src/app.js && node --check src/config.js && node --check src/db.js && node --check src/mcp.js && node --check src/security.js && node --check scripts/migrate.js && node --check scripts/dev.js && node scripts/migrate.js --verify-files",
+    "test": "node --test test/*.test.js",
+    "test:db": "HINDSIGHT_REQUIRE_DB_TESTS=1 node --test test/db.test.js"
+  },
+  "dependencies": {
+    "@auth/express": "^0.12.3",
+    "@modelcontextprotocol/server": "^2.2.0",
+    "express": "^5.1.0",
+    "pg": "^8.13.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.2.0"
+  }
+}

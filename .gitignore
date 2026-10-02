@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.vercel/
+*.log
+coverage/
+.mcp.json
+.cursor/
+opencode.json
+opencode.jsonc
