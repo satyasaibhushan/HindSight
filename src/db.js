@@ -3,6 +3,11 @@ export const REVIEW_STATES = ['new', 'triaged', 'actioned', 'dismissed'];
 export const PAGE_SIZE = 25;
 export const MAX_PAGE = 40;
 export const TOKEN_PAGE_SIZE = 50;
+// Fail before client/Vercel deadlines; the server-side limits stop work in PostgreSQL too.
+export const PG_POOL_OPTIONS = Object.freeze({
+  max: 3, connectionTimeoutMillis: 5000, lock_timeout: 3000,
+  statement_timeout: 10000, query_timeout: 12000,
+});
 
 export function createPgStore(pool) {
   const q = (text, values) => pool.query(text, values);
@@ -10,22 +15,27 @@ export function createPgStore(pool) {
     // Revocation, expiry, and scope are re-checked on every request.
     async authenticateIngestionToken(tokenHash) {
       const { rows } = await q(
-        `UPDATE hindsight_ingestion_tokens SET last_used_at = now()
-         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND scope = 'feedback:submit'
-         RETURNING id, owner_email, client, name`, [tokenHash]);
+        `SELECT id, owner_email, client, name FROM hindsight_ingestion_tokens
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND scope = 'feedback:submit'`, [tokenHash]);
       return rows[0] ? { id: rows[0].id, ownerEmail: rows[0].owner_email, client: rows[0].client, name: rows[0].name } : null;
     },
     // Bounded durable throttle: exactly one row per token (PK token_id) holding the current minute.
     // The upsert row lock serializes concurrent requests, so at most `limit` succeed per window.
+    // Discovery counts too. Track authenticated usage once per minute without another round trip.
     async hitRateLimit(tokenId, limit) {
       const { rows } = await q(
-        `INSERT INTO hindsight_rate_limits AS r (token_id, window_start, count)
+        `WITH hit AS (INSERT INTO hindsight_rate_limits AS r (token_id, window_start, count)
          VALUES ($1, date_trunc('minute', now()), 1)
          ON CONFLICT (token_id) DO UPDATE SET
            window_start = GREATEST(r.window_start, EXCLUDED.window_start),
            count = CASE WHEN EXCLUDED.window_start > r.window_start THEN 1
                         ELSE LEAST(r.count + 1, $2::integer + 1) END
-         RETURNING count`, [tokenId, limit]);
+         RETURNING count), used AS (
+           UPDATE hindsight_ingestion_tokens SET last_used_at = now()
+           WHERE id = $1 AND EXISTS (SELECT 1 FROM hit)
+             AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
+           RETURNING id
+         ) SELECT count FROM hit`, [tokenId, limit]);
       return rows[0].count <= limit;
     },
     // Atomic idempotency: the unique (owner_email, request_id) index serializes concurrent retries.

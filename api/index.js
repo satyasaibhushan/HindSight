@@ -10,8 +10,8 @@ async function init() {
   // No database connection until the full production auth configuration is ready.
   if (config.mcpReady) {
     const { default: pg } = await import('pg');
-    const { createPgStore } = await import('../src/db.js');
-    store = createPgStore(new pg.Pool({ connectionString: config.databaseUrl, max: 3 }));
+    const { createPgStore, PG_POOL_OPTIONS } = await import('../src/db.js');
+    store = createPgStore(new pg.Pool({ connectionString: config.databaseUrl, ...PG_POOL_OPTIONS }));
   }
   const auth = config.webReady ? await buildAuth(config) : { authRouter: null, getReviewer: async () => null };
   return createApp({ config, store, ...auth });

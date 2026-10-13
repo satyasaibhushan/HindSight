@@ -1,6 +1,7 @@
 import express from 'express';
 import { MAX_PAGE, REVIEW_STATES } from './db.js';
 import { CATEGORIES, handleMcp } from './mcp.js';
+import { forwardMcp } from './mcp-http.js';
 import { canonicalHeadersOk, checkCsrf, csrfToken, escapeHtml as e, generateToken, hashToken, safeRelativePath, sameOrigin } from './security.js';
 import { GOOGLE_G, SCRIPT_HASH, alertBox, copyButton, emptyState, icon, shell, solo, when } from './ui.js';
 
@@ -85,19 +86,7 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
     req.ingestionToken = token;
     next();
   }, express.raw({ type: () => true, limit: '32kb' }), async (req, res) => {
-    const headers = new Headers();
-    for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') headers.set(k, v);
-    const hasBody = !['GET', 'HEAD'].includes(req.method) && Buffer.isBuffer(req.body) && req.body.length > 0;
-    const request = new Request(config.publicOrigin + req.originalUrl, {
-      method: req.method, headers, body: hasBody ? req.body : undefined,
-    });
-    const response = await handleMcp(store, req.ingestionToken, request);
-    res.status(response.status);
-    response.headers.forEach((v, k) => res.setHeader(k, v));
-    res.setHeader('Cache-Control', 'no-store');
-    if (!response.body) return res.end();
-    for await (const chunk of response.body) res.write(chunk);
-    res.end();
+    await forwardMcp(req, res, config.publicOrigin, (request) => handleMcp(store, req.ingestionToken, request));
   });
 
   // ---- Web: Google-protected review UI. Fail closed until fully configured.

@@ -26,6 +26,8 @@ plus the retained `connector`, `tooling`, `environment`, `documentation`, `workf
   The token's owner must still be listed in `HINDSIGHT_REVIEWER_EMAILS`. Removing an owner disables
   their tokens at once: requests get the same `401 invalid_token` as an unknown token, before any
   throttle or submission.
+  Its tool catalog is static, so it does not advertise catalog-change subscriptions. Premature client
+  disconnects abort the MCP exchange and cancel its response stream.
 - `/connect` — copyable MCP setup for Claude Code, Codex CLI, Cursor, and OpenCode, filled in with this origin.
 - `/health` — reports `ok` or `setup-required`; no secrets.
 
@@ -98,7 +100,13 @@ All are server-side; see `.env.example` (empty placeholders only). Never commit 
 | `AUTH_SECRET` | Session/CSRF secret, ≥ 32 chars (e.g. `openssl rand -base64 48`). |
 | `HINDSIGHT_REVIEWER_EMAILS` | Comma-separated allowlist; Google email must be verified. |
 | `HINDSIGHT_PUBLIC_ORIGIN` | Canonical bare HTTPS origin, e.g. `https://hindsight.example.com`. |
-| `HINDSIGHT_RATE_LIMIT_PER_MINUTE` | Per-token submissions per minute (1–600, default 20). |
+| `HINDSIGHT_RATE_LIMIT_PER_MINUTE` | Per-token MCP requests per minute (1–600, default 20). |
+
+Authentication reads current token validity on every MCP request; discovery and notifications still
+count against the durable rate limit. `last_used_at` records authenticated usage at most once per
+minute, so its timestamp may lag the latest request by up to a minute. Storage uses at most three
+connections per instance, with 5-second connection/acquisition, 3-second lock, 10-second SQL statement,
+and 12-second client query deadlines. PostgreSQL cancels statements and lock waits at its deadlines.
 
 Google OAuth redirect URI: `<HINDSIGHT_PUBLIC_ORIGIN>/auth/callback/google`.
 

@@ -1,4 +1,5 @@
 {
   "framework": null,
+  "git": { "deploymentEnabled": { "stop-idle-mcp-work": false } },
   "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
 }

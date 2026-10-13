@@ -39,3 +39,19 @@ export function call(base, path, { method = 'GET', headers = {}, body, signal } 
 }
 
 export const text = (res) => res.body.toString('utf8');
+
+export const modernListen = () => ({
+  jsonrpc: '2.0', id: 'listen-1', method: 'subscriptions/listen',
+  params: {
+    _meta: {
+      'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+      'io.modelcontextprotocol/clientInfo': { name: 'hindsight-test', version: '1' },
+      'io.modelcontextprotocol/clientCapabilities': {},
+    },
+    notifications: { toolsListChanged: true },
+  },
+});
+export const modernListenHeaders = {
+  'content-type': 'application/json', accept: 'application/json, text/event-stream',
+  'mcp-protocol-version': '2026-07-28', 'mcp-method': 'subscriptions/listen',
+};
