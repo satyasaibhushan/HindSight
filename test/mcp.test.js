@@ -5,7 +5,7 @@ import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { handleMcp, payloadHash } from '../src/mcp.js';
 import { hashToken } from '../src/security.js';
-import { ORIGIN, call, env, serve } from './helpers.js';
+import { ORIGIN, call, env, modernListen, modernListenHeaders, serve } from './helpers.js';
 
 const OWNER = 'owner@example.com';
 const tokenA = { id: 't-a1', ownerEmail: OWNER, client: 'claude-code', name: 'laptop' };
@@ -35,8 +35,8 @@ function memoryStore() {
   return s;
 }
 
-async function withClient(fetchImpl, fn) {
-  const client = new Client({ name: 'hindsight-test', version: '0.0.0' });
+async function withClient(fetchImpl, fn, options) {
+  const client = new Client({ name: 'hindsight-test', version: '0.0.0' }, options);
   await client.connect(new StreamableHTTPClientTransport(new URL(ORIGIN + '/api/mcp'), { fetch: fetchImpl }));
   try { return await fn(client); } finally { await client.close(); }
 }
@@ -64,12 +64,26 @@ test('payload fingerprint binds client and normalized payload, not token id', ()
 test('official client initializes and lists exactly one submit_feedback tool', async () => {
   await withClient(direct(memoryStore(), tokenA), async (client) => {
     assert.equal(client.getServerVersion()?.name, 'hindsight');
+    assert.equal(client.getServerCapabilities().tools.listChanged, false);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((t) => t.name), ['submit_feedback']);
     for (const field of ['request_id', 'friction', 'improvement', 'category']) {
       assert.ok(tools[0].inputSchema.required.includes(field), field);
     }
   });
+});
+
+test('a modern static-catalog subscription acknowledges no changes and completes', async () => {
+  const request = new Request(ORIGIN + '/api/mcp', {
+    method: 'POST', headers: modernListenHeaders, body: JSON.stringify(modernListen()),
+    signal: AbortSignal.timeout(1000),
+  });
+  const response = await handleMcp(memoryStore(), tokenA, request);
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /notifications\/subscriptions\/acknowledged/);
+  assert.match(body, /"notifications":\{\}/);
+  assert.match(body, /"resultType":"complete"/);
 });
 
 test('normal retry replays the persisted row', async () => {
@@ -189,6 +203,18 @@ test('official client works end to end through the gated /api/mcp route', async 
     });
   });
   assert.ok(store.throttled > 0);
+});
+
+test('modern official client discovers and submits through the gated route', async () => {
+  const TOKEN = 'hs_' + 'D'.repeat(43);
+  const store = memoryStore();
+  await serve(gatedApp(store, tokenA, TOKEN), async (baseUrl) => {
+    await withClient(viaApp(baseUrl, TOKEN), async (client) => {
+      assert.equal(client.getServerCapabilities().tools.listChanged, false);
+      assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['submit_feedback']);
+      assert.equal(out(await submit(client, base)), 'Recorded feedback fb-1 for claude-code.');
+    }, { versionNegotiation: { mode: { pin: '2026-07-28' } } });
+  });
 });
 
 test('official client cannot connect with a token whose owner is not a configured reviewer', async () => {

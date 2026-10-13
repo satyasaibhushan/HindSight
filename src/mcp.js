@@ -38,7 +38,10 @@ const result = (message, isError = false) => ({ content: [{ type: 'text', text: 
 
 // One fresh server per request; the authenticated token is bound in the closure.
 export function createServer(store, token) {
-  const server = new McpServer({ name: 'hindsight', version: '0.2.0' });
+  // The catalog is fixed; advertising changes makes modern clients open an idle subscription.
+  const server = new McpServer({ name: 'hindsight', version: '0.2.0' }, {
+    capabilities: { tools: { listChanged: false } },
+  });
   server.registerTool('submit_feedback', {
     description: 'Record attributable, user-reviewable feedback (not anonymous) on the user\'s shared instructions, ' +
       'skills, codebase, collaboration, or tools/connectors. ' +
@@ -65,9 +68,37 @@ export function createServer(store, token) {
   return server;
 }
 
-export function handleMcp(store, token, request) {
+export async function handleMcp(store, token, request) {
   const handler = createMcpHandler(() => createServer(store, token));
-  return handler.fetch(request, {
-    authInfo: { token: token.id, clientId: token.client, scopes: ['feedback:submit'], extra: { tokenId: token.id } },
-  });
+  try {
+    const response = await handler.fetch(request, {
+      authInfo: { token: token.id, clientId: token.client, scopes: ['feedback:submit'], extra: { tokenId: token.id } },
+    });
+    if (!response.body) {
+      await handler.close();
+      return response;
+    }
+    const reader = response.body.getReader();
+    let closing;
+    const close = (cancel = false, reason) => closing ??= (async () => {
+      try { if (cancel) await reader.cancel(reason); }
+      finally { await handler.close(); reader.releaseLock(); }
+    })();
+    return new Response(new ReadableStream({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) { await close(); controller.close(); }
+          else controller.enqueue(value);
+        } catch (error) {
+          await close(true, error);
+          controller.error(error);
+        }
+      },
+      cancel: (reason) => close(true, reason),
+    }), response);
+  } catch (error) {
+    await handler.close();
+    throw error;
+  }
 }

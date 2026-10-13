@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { after, before, describe, test } from 'node:test';
 import { assertScoped, loadMigrations, planMigrations, runMigrations } from '../scripts/migrate.js';
-import { createPgStore, TOKEN_PAGE_SIZE } from '../src/db.js';
+import { createPgStore, PG_POOL_OPTIONS, TOKEN_PAGE_SIZE } from '../src/db.js';
 import { CATEGORIES, payloadHash } from '../src/mcp.js';
 import { generateToken, hashToken } from '../src/security.js';
 
@@ -203,6 +203,58 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       category: 'tooling', ...extra,
     });
     const submit = (s, tok, f) => s.insertFeedback(tok, f, payloadHash(f, tok.client));
+
+    test('authentication reads current validity without writing; usage updates at most once per minute', async () => {
+      const t = await token(store, 'usage@example.com');
+      const pool = schemaPool(schema);
+      const usage = async () => (await pool.query(
+        'SELECT last_used_at, xmin::text AS version FROM hindsight_ingestion_tokens WHERE id = $1', [t.id])).rows[0];
+      const unused = await usage();
+      assert.equal(unused.last_used_at, null);
+      await store.authenticateIngestionToken(hashToken(t.plaintext));
+      assert.deepEqual(await usage(), unused);
+      assert.equal(await store.hitRateLimit(t.id, 2), true);
+      const first = await usage();
+      assert.ok(first.last_used_at);
+      assert.equal(await store.hitRateLimit(t.id, 2), true);
+      assert.equal(await store.hitRateLimit(t.id, 2), false);
+      assert.deepEqual(await usage(), first); // includes rate-limited attempts, without repeated token writes
+      await pool.query(`UPDATE hindsight_ingestion_tokens SET last_used_at = now() - interval '2 minutes' WHERE id = $1`, [t.id]);
+      await store.hitRateLimit(t.id, 2);
+      assert.ok((await usage()).last_used_at > first.last_used_at);
+      await store.revokeToken('usage@example.com', t.id);
+      assert.equal(await store.authenticateIngestionToken(hashToken(t.plaintext)), null);
+    });
+
+    test('production pool limits bound statements and lock waits and recover after cancellation', { timeout: 20000 }, async () => {
+      const pool = new pg.Pool({ connectionString: target.url, ...PG_POOL_OPTIONS,
+        options: `-c search_path=${schema}`, application_name: 'hindsight-timeout-test' });
+      pools.push(pool);
+      assert.equal((await pool.query('SHOW statement_timeout')).rows[0].statement_timeout, '10s');
+      assert.equal((await pool.query('SHOW lock_timeout')).rows[0].lock_timeout, '3s');
+      await assert.rejects(pool.query('SELECT pg_sleep(11)'), (error) => error.code === '57014');
+      assert.equal((await pool.query('SELECT 1 AS n')).rows[0].n, 1);
+      const t = await token(store, 'locked@example.com');
+      const locked = await pool.connect();
+      try {
+        await locked.query('BEGIN');
+        await locked.query('SELECT id FROM hindsight_ingestion_tokens WHERE id = $1 FOR UPDATE', [t.id]);
+        const other = createPgStore(pool);
+        await assert.rejects(other.hitRateLimit(t.id, 20), (error) => error.code === '55P03');
+        await locked.query('ROLLBACK');
+        assert.equal(await other.hitRateLimit(t.id, 20), true);
+      } finally { await locked.query('ROLLBACK'); locked.release(); }
+    });
+
+    test('production pool bounds acquisition when all connections are busy', { timeout: 10000 }, async () => {
+      const pool = new pg.Pool({ connectionString: target.url, ...PG_POOL_OPTIONS,
+        application_name: 'hindsight-acquisition-test' });
+      pools.push(pool);
+      const clients = await Promise.all(Array.from({ length: PG_POOL_OPTIONS.max }, () => pool.connect()));
+      try { await assert.rejects(pool.query('SELECT 1'), /timeout exceeded when trying to connect/); }
+      finally { for (const client of clients) client.release(); }
+      assert.equal((await pool.query('SELECT 1 AS n')).rows[0].n, 1);
+    });
 
     test('persists across store instances and pools', async () => {
       const t = await token(store, 'persist@example.com');
