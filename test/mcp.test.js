@@ -177,6 +177,11 @@ function gatedApp(store, token, TOKEN) {
   store.throttled = 0;
   store.authenticateIngestionToken = async (h) => (h === hashToken(TOKEN) ? token : null);
   store.hitRateLimit = async () => { store.throttled += 1; return true; };
+  store.authenticateAndRateLimit = async (h, reviewers) => {
+    const allowed = h === hashToken(TOKEN) && reviewers.includes(token.ownerEmail.trim().toLowerCase());
+    if (allowed) store.throttled += 1;
+    return { token: allowed ? token : null, allowed };
+  };
   return createApp({ config: loadConfig(env), store, getReviewer: async () => null,
     authRouter: (_req, res) => res.status(404).end() });
 }

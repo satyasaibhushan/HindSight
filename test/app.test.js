@@ -30,6 +30,13 @@ function fakeStore({ token = 'active', fail = false, limited = false, hasMore = 
   s.authenticateIngestionToken = rec('authenticateIngestionToken', (h) =>
     (h === hashToken(TOKEN) && token === 'active' ? { id: 't1', ownerEmail: tokenOwner, client: 'c' } : null));
   s.hitRateLimit = rec('hitRateLimit', () => !limited);
+  s.authenticateAndRateLimit = rec('authenticateAndRateLimit', async (h, reviewers) => {
+    if (h !== hashToken(TOKEN) || token !== 'active' || !reviewers.includes(tokenOwner.trim().toLowerCase())) {
+      return { token: null, allowed: false };
+    }
+    return { token: { id: 't1', ownerEmail: tokenOwner, client: 'c' },
+      allowed: reviewers.includes(tokenOwner) ? !limited : await s.hitRateLimit('t1') };
+  });
   s.listFeedback = rec('listFeedback', (owner, filters) => {
     s.lists.push([owner, filters]);
     return { rows: [{ id: ID, client: 'c<b>', request_id: 'req-00001', friction: '<script>alert(1)</script>',
@@ -233,7 +240,7 @@ test('MCP rejects missing, malformed, revoked/expired, and cross-origin credenti
     await serve(app(store), async (base) => {
       assert.equal((await call(base, '/api/mcp', { method: 'POST', headers: bearer })).status, 401);
     });
-    assert.deepEqual(store.calls, ['authenticateIngestionToken']);
+    assert.deepEqual(store.calls, ['authenticateAndRateLimit']);
   }
 });
 
@@ -286,14 +293,14 @@ test('token whose owner was removed from reviewers is rejected before throttle o
       assert.deepEqual(JSON.parse(text(res)), { error: 'invalid_token' }); // no owner-policy detail
     }
   });
-  assert.deepEqual(store.calls, Array(3).fill('authenticateIngestionToken')); // no hitRateLimit/insertFeedback
+  assert.deepEqual(store.calls, Array(3).fill('authenticateAndRateLimit')); // no hitRateLimit/insertFeedback
 
   // Configured owner (stored with different case/whitespace) still reaches throttle and MCP.
   const ok = fakeStore({ tokenOwner: ' Owner@Example.com ' });
   await serve(app(ok), async (base) => {
     assert.equal((await rpc(base, RPC.initialize)).status, 200);
   });
-  assert.deepEqual(ok.calls, ['authenticateIngestionToken', 'hitRateLimit']);
+  assert.deepEqual(ok.calls, ['authenticateAndRateLimit', 'hitRateLimit']);
 });
 
 test('only the sign-in page may submit forms to the exact Google authorization origin', async () => {

@@ -9,6 +9,9 @@ import { assertScoped, loadMigrations, planMigrations, runMigrations } from '../
 import { createPgStore, PG_POOL_OPTIONS, TOKEN_PAGE_SIZE } from '../src/db.js';
 import { CATEGORIES, payloadHash } from '../src/mcp.js';
 import { generateToken, hashToken } from '../src/security.js';
+import { createApp } from '../src/app.js';
+import { loadConfig } from '../src/config.js';
+import { call, env, serve } from './helpers.js';
 
 // The four authored migration files; every ledger assertion below derives from this list.
 const EXPECTED = [['001', 'hindsight'], ['002', 'idempotency_review'], ['003', 'bounded_rate_limits'],
@@ -224,6 +227,116 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       assert.ok((await usage()).last_used_at > first.last_used_at);
       await store.revokeToken('usage@example.com', t.id);
       assert.equal(await store.authenticateIngestionToken(hashToken(t.plaintext)), null);
+    });
+
+    test('canonical MCP discovery authenticates and throttles in one round trip', async () => {
+      const t = await token(store, 'owner@example.com');
+      const pool = schemaPool(schema);
+      let queries = 0;
+      const counted = createPgStore({ query: (...args) => { queries++; return pool.query(...args); } });
+      const oldToken = await counted.authenticateIngestionToken(hashToken(t.plaintext));
+      await counted.hitRateLimit(oldToken.id, 20);
+      assert.equal(queries, 2); // The previous authenticate-then-throttle path.
+      const app = createApp({ config: loadConfig(env), store: counted, getReviewer: async () => null,
+        authRouter: (_req, res) => res.status(404).end() });
+      await serve(app, async (base) => {
+        for (let i = 0; i < 3; i++) {
+          const before = queries;
+          const response = await call(base, '/api/mcp', { method: 'POST', headers: {
+            authorization: 'Bearer ' + t.plaintext, 'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+          }, body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/list' }) });
+          assert.equal(response.status, 200);
+          assert.equal(queries - before, 1);
+          assert.match(response.body.toString(), /submit_feedback/);
+        }
+      });
+      const usage = (await pool.query('SELECT last_used_at FROM hindsight_ingestion_tokens WHERE id=$1', [t.id])).rows[0];
+      assert.ok(usage.last_used_at);
+    });
+
+    test('combined authentication durably caps concurrent hits and writes usage once per minute', async () => {
+      const owner = 'combined-race@example.com', t = await token(store, owner);
+      const pool = schemaPool(schema), other = createPgStore(pool);
+      // Pin the fixture window so the burst cannot straddle a wall-clock minute rollover.
+      await pool.query(`INSERT INTO hindsight_rate_limits (token_id,window_start,count)
+        VALUES ($1,date_trunc('minute',now())+interval '1 hour',0)`, [t.id]);
+      const authenticate = () => other.authenticateAndRateLimit(hashToken(t.plaintext), [owner], 5);
+      const usage = async () => (await pool.query(
+        'SELECT last_used_at,xmin::text AS version FROM hindsight_ingestion_tokens WHERE id=$1', [t.id])).rows[0];
+      assert.equal((await usage()).last_used_at, null);
+      assert.equal((await authenticate()).allowed, true);
+      const first = await usage();
+      const results = await Promise.all(Array.from({ length: 20 }, authenticate));
+      assert.equal(results.filter((r) => r.allowed).length, 4);
+      assert.ok(results.every((r) => r.token.id === t.id));
+      assert.deepEqual(await usage(), first);
+      const rate = (await pool.query('SELECT count FROM hindsight_rate_limits WHERE token_id=$1', [t.id])).rows[0];
+      assert.equal(rate.count, 6);
+      await pool.query("UPDATE hindsight_rate_limits SET window_start=now()-interval '2 minutes' WHERE token_id=$1", [t.id]);
+      await pool.query("UPDATE hindsight_ingestion_tokens SET last_used_at=now()-interval '2 minutes' WHERE id=$1", [t.id]);
+      assert.equal((await authenticate()).allowed, true);
+      assert.ok((await usage()).last_used_at > first.last_used_at);
+    });
+
+    test('combined authentication checks revocation, expiry and current owner allowlist before writes', async () => {
+      const owner = 'combined-validity@example.com', t = await token(store, owner);
+      const pool = schemaPool(schema);
+      assert.equal((await store.authenticateAndRateLimit(hashToken(t.plaintext), [owner], 20)).allowed, true);
+      const before = (await pool.query('SELECT count FROM hindsight_rate_limits WHERE token_id=$1', [t.id])).rows[0].count;
+      const denied = { token: null, allowed: false };
+      assert.deepEqual(await store.authenticateAndRateLimit(hashToken(t.plaintext), ['other@example.com'], 20), denied);
+      await store.revokeToken(owner, t.id);
+      assert.deepEqual(await store.authenticateAndRateLimit(hashToken(t.plaintext), [owner], 20), denied);
+      assert.equal((await pool.query('SELECT count FROM hindsight_rate_limits WHERE token_id=$1', [t.id])).rows[0].count, before);
+      const expired = await token(store, owner);
+      await pool.query("UPDATE hindsight_ingestion_tokens SET created_at=now()-interval '2 hours',expires_at=now()-interval '1 hour' WHERE id=$1", [expired.id]);
+      assert.deepEqual(await store.authenticateAndRateLimit(hashToken(expired.plaintext), [owner], 20), denied);
+      assert.deepEqual(await store.authenticateAndRateLimit(hashToken(generateToken()), [owner], 20), denied);
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM hindsight_rate_limits WHERE token_id=$1', [expired.id])).rows[0].n, 0);
+    });
+
+    test('legacy mixed-case and Unicode whitespace owners retain JS normalization fallback', async () => {
+      const pool = schemaPool(schema);
+      let queries = 0;
+      const counted = createPgStore({ query: (...args) => { queries++; return pool.query(...args); } });
+      for (const owner of [' Owner@Example.com ', '\u00a0Owner@Example.com\uFEFF']) {
+        const t = await token(store, owner);
+        queries = 0;
+        const first = await counted.authenticateAndRateLimit(hashToken(t.plaintext), ['owner@example.com'], 1);
+        assert.equal(queries, 2);
+        assert.equal(first.allowed, true);
+        assert.equal(first.token.ownerEmail, owner);
+        assert.equal((await counted.authenticateAndRateLimit(hashToken(t.plaintext), ['owner@example.com'], 1)).allowed, false);
+        const before = (await pool.query('SELECT count FROM hindsight_rate_limits WHERE token_id=$1', [t.id])).rows[0].count;
+        assert.deepEqual(await counted.authenticateAndRateLimit(hashToken(t.plaintext), ['removed@example.com'], 1), { token: null, allowed: false });
+        assert.equal((await pool.query('SELECT count FROM hindsight_rate_limits WHERE token_id=$1', [t.id])).rows[0].count, before);
+      }
+    });
+
+    test('combined authentication storage failure rolls back throttle and fails the route closed', async () => {
+      const owner = 'combined-failure@example.com', t = await token(store, owner);
+      const pool = schemaPool(schema);
+      await pool.query(`CREATE FUNCTION hindsight_fail_usage() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.owner_email='combined-failure@example.com' THEN RAISE EXCEPTION 'synthetic usage failure'; END IF;
+        RETURN NEW; END $$`);
+      await pool.query(`CREATE TRIGGER hindsight_fail_usage BEFORE UPDATE OF last_used_at
+        ON hindsight_ingestion_tokens FOR EACH ROW EXECUTE FUNCTION hindsight_fail_usage()`);
+      try {
+        const app = createApp({ config: loadConfig({ ...env, HINDSIGHT_REVIEWER_EMAILS: owner }), store,
+          getReviewer: async () => null, authRouter: (_req, res) => res.status(404).end() });
+        await serve(app, async (base) => {
+          const response = await call(base, '/api/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + t.plaintext } });
+          assert.equal(response.status, 503);
+          assert.deepEqual(JSON.parse(response.body), { error: 'storage_unavailable' });
+        });
+        assert.equal((await pool.query('SELECT count(*)::int AS n FROM hindsight_rate_limits WHERE token_id=$1', [t.id])).rows[0].n, 0);
+        assert.equal((await pool.query('SELECT last_used_at FROM hindsight_ingestion_tokens WHERE id=$1', [t.id])).rows[0].last_used_at, null);
+      } finally {
+        await pool.query('DROP TRIGGER hindsight_fail_usage ON hindsight_ingestion_tokens');
+        await pool.query('DROP FUNCTION hindsight_fail_usage()');
+      }
+      assert.equal((await store.authenticateAndRateLimit(hashToken(t.plaintext), [owner], 20)).allowed, true);
     });
 
     test('production pool limits bound statements and lock waits and recover after cancellation', { timeout: 20000 }, async () => {

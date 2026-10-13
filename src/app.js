@@ -69,12 +69,14 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
     const match = /^Bearer (hs_[A-Za-z0-9_-]{43})$/.exec(req.get('authorization') || '');
     let token = null;
     try {
-      token = match && await store.authenticateIngestionToken(hashToken(match[1]));
-      // The owner must still be a configured reviewer. Checked before throttle/MCP; a removed owner gets
-      // the same generic invalid_token response as an unknown token.
+      const authenticated = match && await store.authenticateAndRateLimit(
+        hashToken(match[1]), config.reviewers, config.rateLimitPerMinute);
+      token = authenticated?.token;
+      // The store throttles only configured owners; retain the middleware allowlist guard too.
+      // A removed owner gets the same generic invalid_token response as an unknown token.
       const owner = typeof token?.ownerEmail === 'string' ? token.ownerEmail.trim().toLowerCase() : '';
       if (token && !config.reviewers.includes(owner)) token = null;
-      if (token && !await store.hitRateLimit(token.id, config.rateLimitPerMinute)) {
+      if (token && !authenticated.allowed) {
         return res.status(429).set('Retry-After', '60').json({ error: 'rate_limited' });
       }
     } catch {

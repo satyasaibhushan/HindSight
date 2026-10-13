@@ -19,6 +19,36 @@ export function createPgStore(pool) {
          WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND scope = 'feedback:submit'`, [tokenHash]);
       return rows[0] ? { id: rows[0].id, ownerEmail: rows[0].owner_email, client: rows[0].client, name: rows[0].name } : null;
     },
+    // Canonical allow-listed owners authenticate, throttle, and record usage in one round trip.
+    // Keep the JS trim/lowercase fallback for legacy owners: SQL lower/btrim does not have
+    // exactly the same Unicode semantics, and rejected owners must never consume the limit.
+    async authenticateAndRateLimit(tokenHash, reviewers, limit) {
+      const { rows } = await q(
+        `WITH token AS MATERIALIZED (
+           SELECT id, owner_email, client, name FROM hindsight_ingestion_tokens
+           WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND scope = 'feedback:submit'
+         ), hit AS (
+           INSERT INTO hindsight_rate_limits AS r (token_id, window_start, count)
+           SELECT id, date_trunc('minute', now()), 1 FROM token WHERE owner_email = ANY($2::text[])
+           ON CONFLICT (token_id) DO UPDATE SET
+             window_start = GREATEST(r.window_start, EXCLUDED.window_start),
+             count = CASE WHEN EXCLUDED.window_start > r.window_start THEN 1
+                          ELSE LEAST(r.count + 1, $3::integer + 1) END
+           RETURNING token_id, count
+         ), used AS (
+           UPDATE hindsight_ingestion_tokens SET last_used_at = now()
+           WHERE id IN (SELECT token_id FROM hit)
+             AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
+           RETURNING id
+         ) SELECT t.id, t.owner_email, t.client, t.name, h.count AS rate_count
+           FROM token t LEFT JOIN hit h ON h.token_id = t.id`, [tokenHash, reviewers, limit]);
+      const row = rows[0];
+      const owner = typeof row?.owner_email === 'string' ? row.owner_email.trim().toLowerCase() : '';
+      if (!row || !reviewers.includes(owner)) return { token: null, allowed: false };
+      const token = { id: row.id, ownerEmail: row.owner_email, client: row.client, name: row.name };
+      const allowed = row.rate_count === null ? await this.hitRateLimit(row.id, limit) : row.rate_count <= limit;
+      return { token, allowed };
+    },
     // Bounded durable throttle: exactly one row per token (PK token_id) holding the current minute.
     // The upsert row lock serializes concurrent requests, so at most `limit` succeed per window.
     // Discovery counts too. Track authenticated usage once per minute without another round trip.
