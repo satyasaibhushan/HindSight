@@ -14,12 +14,14 @@ plus the retained `connector`, `tooling`, `environment`, `documentation`, `workf
 - `/auth/signin`, `/auth/signout` — HindSight's own sign-in ("Continue with Google") and sign-out screens.
   Their forms POST to Auth.js with the CSRF token Auth.js issued; Auth.js errors (e.g. a non-allowlisted
   account) redirect back to the sign-in screen with a readable message.
-- `/review` (Inbox) — reviewers (Google sign-in, email allowlist) read their own feedback, filter by state,
-  category, and API key, set review state with one click, and keep a private review note per item.
-- `/tokens` (API keys) — reviewers create, list, and revoke API keys (7/30/60/90 day expiry) with an access
-  level: **Ingest (submit only)**, scope `feedback:submit`, or **Admin (read & manage tasks)**, scope
-  `feedback:admin` (see [Admin keys](#admin-keys-and-the-rest-api)). The list and the one-time reveal show
-  the scope. A key has only a **name**; that name is stored as the token's client label, which attributes
+- `/review` (Inbox) — reviewers (Google sign-in, email allowlist) work through their own feedback as a checklist
+  (see [Inbox checklist](#inbox-checklist)): tick an item to mark it done, expand it for the friction, context, request id,
+  a private review note, and Plan / Won't do / Mark done, or select many and change them at once.
+- `/tokens` (API keys) — reviewers create, list, and revoke API keys (7/30/60/90 day expiry) with a scope chosen
+  from two cards: **Ingest** (default), scope `feedback:submit`, or **Admin**, scope `feedback:admin`
+  (see [Admin keys](#admin-keys-and-the-rest-api)). Admin keys are amber everywhere: picking Admin shows a warning
+  (CSS `:has`; browsers without it always show the warning), and the list and the one-time reveal mark admin keys.
+  The list stacks into label/value rows on narrow screens. A key has only a **name**; that name is stored as the token's client label, which attributes
   and idempotency-binds its submissions (the `client` column is kept, so existing tokens and rows are unchanged).
   The list is newest first, 50 per page, using a keyset cursor `?before=<token id>` (the last id on the
   previous page). The cursor is resolved only among the signed-in owner's tokens, so every token,
@@ -34,13 +36,15 @@ plus the retained `connector`, `tooling`, `environment`, `documentation`, `workf
   disconnects abort the MCP exchange and cancel its response stream.
 - `/api/v1` — JSON REST API for admin keys (`Authorization: Bearer hs_…`): list, get, and update feedback.
   Same gate as `/api/mcp`; session cookies are never accepted.
-- `/connect` — copyable MCP setup for Claude Code, Codex CLI, Cursor, and OpenCode, filled in with this origin.
+- `/connect` — copyable MCP setup for Claude Code, Codex CLI, Cursor, and OpenCode, filled in with this origin, plus a
+  "Use an admin key" section (`/connect#admin`) with the admin MCP tools and `/api/v1` examples.
 - `/health` — reports `ok` or `setup-required`; no secrets.
 
 All pages send `Content-Security-Policy` with `default-src 'none'` and `form-action 'self'`. The one exception
 is the sign-in page (`/auth/signin`), which also allows `https://accounts.google.com` so its Google redirect
 can complete. The only script is one small inline progressive-enhancement script (copy buttons, revoke
-confirmation, filter auto-submit), allowed by its SHA-256 hash; every page works without it. Icons and the
+confirmation, filter auto-submit, closing the `⋯` menu on an outside click or Escape, the live "N selected" count, and
+opening an item after its note is saved), allowed by its SHA-256 hash; every page works without it. Icons and the
 Google logo are inline SVG, so nothing external is loaded. (Auth.js's built-in sign-in page loaded its Google
 logo from `authjs.dev`, which this CSP blocked, leaving a broken image in the button.)
 
@@ -48,6 +52,33 @@ Feedback is attributable to the owner and the API key (token name) that submitte
 Do not submit secrets, transcripts, or provider-private prompts or policies; obvious secret patterns
 are rejected. Submit best effort at final handoff, skip generic or no-op notes, and reuse a
 `request_id` only to retry the identical submission (see `docs/agent-feedback.md`).
+
+## Inbox checklist
+
+The Inbox treats each item as a task. The **improvement** is the title; the friction, the context (repository, task,
+source, outcome, confidence), the request id with a copy button, the review note form, and the state buttons sit in a
+native `<details>` panel. Every control is a plain form POST or link, so the page works without JavaScript.
+
+| Stored `review_state` | Shown as | Checkbox | Ticking it |
+| --- | --- | --- | --- |
+| `new` | Open | empty | marks it Done (`actioned`) |
+| `triaged` | Planned (a dot and a "Planned" tag) | empty with a dot | marks it Done |
+| `actioned` | Done (title struck through) | ticked | reopens it (`new`) |
+| `dismissed` | Won't do (muted, with a tag) | dash | reopens it (`new`) |
+
+- **Views** are tabs with per-view counts: **Open** (`new` + `triaged`, the default), **Done**, **Won't do**, **All**.
+  The counts are one owner-scoped `GROUP BY review_state` query that honours the category and API-key filters.
+  The query is `?state=open|done|wontdo|all`. Old links keep working: `?state=actioned` opens Done, `?state=dismissed`
+  opens Won't do, and `?state=new` or `?state=triaged` narrows the Open view to that one state (with a "Show all open" link).
+  `/review` with no `state` now opens the Open view rather than everything.
+- **Filters**: category, API key, and grouping (`?group=` omitted for date, `category`, or `none`). Date groups are
+  Today / Yesterday / Earlier by UTC calendar day. The selects auto-submit with JavaScript; an Apply button covers the rest.
+- **Row actions**: the `⋯` menu (a `<details>`) offers Plan/Unplan, Won't do or Reopen, "Only this API key", and copy
+  request id. After a change the page returns to the same view, scrolled to and marking the changed row.
+- **Bulk select** (`?select=1`): every row gets a real checkbox tied to one form that POSTs `ids` and `state` to
+  `/review/bulk`. It is CSRF- and origin-checked like every other form, takes 1–100 well-formed ids (anything else is
+  `400`), and uses the same owner-scoped atomic store update as the admin API, so another owner's ids are never changed.
+- **Pages**: 25 items per page with Newer/Older links (`?page=`), as before.
 
 ## Status: setup-required
 
@@ -83,6 +114,10 @@ the port. There are no demo users, tokens, or auth-bypass switches.
 
 - `test/app.test.js`, `test/mcp.test.js`, and the migration scope-guard test use in-memory stores
   and synthetic `.invalid` config; they need no database.
+- `node scripts/screenshots.js` regenerates `docs/screenshots/after/*.png`: it boots the real app on the in-memory test
+  store with synthetic config, a fixed signed-in reviewer, and seeded sample data, and captures it with Playwright
+  (desktop, 390px mobile, light and dark). Playwright is not a project dependency: it needs a local Playwright and
+  Chromium (`PLAYWRIGHT_MODULE` may point at its entry file). It never touches a database.
 - `test/db.test.js` (migrations, persistence, category roundtrip and filtering, owner isolation,
   expiry/revocation, idempotency, throttling, token keyset paging over more than 100 tokens, admin scope,
   admin feedback paging/get/update/bulk, and the REST/MCP admin gate end to end) needs `HINDSIGHT_TEST_DATABASE_URL`. It never reads `DATABASE_URL` for connections and

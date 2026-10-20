@@ -115,6 +115,43 @@ Branch `revamp/checklist-admin-keys`. Purpose: let the owner read and act on the
   passed 29/29 on a local disposable PostgreSQL 16 `hindsight_test`. A manual curl run against a live
   server on PostgreSQL also passed (list, cursor, PATCH, bulk, ingest key `403`, non-canonical `421`).
 
+## Checklist UI revamp (authored and run locally in this session; not yet operator-verified)
+
+Branch `revamp/checklist-admin-keys`, on top of the admin-keys backend. Follows the design spec and mockup
+(the Inbox as a to-do list; amber for admin keys).
+
+- **Tokens and shell** (`src/ui.js`): the new light/dark token set (`--ok/--planned/--warn/--danger/--admin…`), a smaller
+  topbar, and restyled sign-in, sign-out, setup-required, and error screens. The one inline script gained: close the
+  `⋯` menu on an outside click or Escape, a live "N selected" count, and opening an item whose note was just saved. It is
+  still interpolation-free and pinned by its SHA-256 hash. A short `ago()` formatter ("14 min ago", "Yesterday") goes with
+  the UTC-day groups.
+- **Inbox** (`/review`): compact checklist rows. The checkbox is a submit button (`role=checkbox`, `aria-checked`):
+  ticking posts `actioned`, and ticking a done or won't-do item posts `new`. The improvement is the title. A native
+  `<details>` holds the friction, facts, request id plus copy button, the review note form (moved in from its own
+  collapsible), and Plan / Won't do / Mark done. There is a `⋯` overflow menu, Open/Done/Won't do/All tabs with counts,
+  category/API key/group filters, date or category group headers, empty states, and Newer/Older paging (unchanged).
+  Legacy `?state=` values are mapped (README).
+- **Bulk** (`POST /review/bulk`): one form (`id="bulk"`, rows join it via `form=`), with CSRF and origin checks, an
+  owner-scoped update via `admin.js` `bulkUpdate` and the existing `bulkSetReviewState`, 1–100 UUIDs, and a valid state.
+  Otherwise it returns `400`.
+- **Store**: `listFeedback` accepts `states` (array; single `state` still works); new `countFeedback(owner, {category,
+  client})` returns every state's count. Both are in `src/db.js` and the in-memory mirror in `test/helpers.js`.
+- **API keys**: the two-card radio scope chooser (Ingest default), the admin warning via `:has` (always visible
+  without it), an amber create button, an amber admin reveal with `HINDSIGHT_ADMIN_TOKEN` and a link to `/connect#admin`,
+  and a key table with a Scope column (stacks on mobile). On a validation error the posted name, scope, and expiry are kept.
+- **Connect**: the "Use an admin key" section with the real tool names (`list_feedback`, `get_feedback`,
+  `update_feedback_state`, `bulk_update_feedback_state`), `/api/v1` curl examples, and a note that admin keys can also submit.
+- **Screenshots**: `scripts/screenshots.js` (new; added to `npm run check`) regenerated `docs/screenshots/after/01–13`
+  and added 14–19 (bulk select desktop/mobile, admin key created, connect admin, mobile dark, keys dark).
+- **Tests**: `test/app.test.js` assertions on the old markup were updated. New tests cover the checklist rows, tabs,
+  owner-scoped counts, and groups; tick/untick/reopen; empty states; bulk (CSRF, origin, owner isolation, the 100 cap,
+  invalid state and ids, select-mode markup); the scope chooser; and the connect admin section. `test/db.test.js` adds
+  multi-state listing, filtered owner-scoped counts, and bulk isolation on PostgreSQL.
+- **Run in this session** (Node 22.22, the only Node available; `engines` says 24): `npm run check` passed, `npm test`
+  passed 81/81, and `npm run test:db` passed 30/30 on the local disposable PostgreSQL 16 `hindsight_test`. A headless
+  Chromium check at 390px found no horizontal scroll on any page and no CSP console errors, with and without
+  JavaScript. The no-JS tick and bulk round trips also worked.
+
 ## Operator-run diagnostics (reported to the author, not run by the author)
 
 - slice004: clean install, syntax check, 41 tests, and `npm audit` (0) passed. Manual checks on isolated
@@ -136,4 +173,5 @@ Branch `revamp/checklist-admin-keys`. Purpose: let the owner read and act on the
       real Google/session/reviewer config, custom domain, explicit migration (README checklist).
 - [ ] Not yet tested: real Google sign-in, any of the four MCP client configs end to end, production persistence.
 - [ ] Operator: apply `005` (`npm run migrate` plan must list only it), then run README checklist step 9 (admin key).
-- [ ] Reviewer: browser check of the `/tokens` Access select and the `/review` note form (restyle pending).
+- [ ] Reviewer: browser check of the checklist Inbox (tick, reopen, `⋯` menu, bulk select, notes), the `/tokens` scope
+      chooser, and `/connect#admin` in Safari and Firefox as well as Chromium (only headless Chromium was used here).
