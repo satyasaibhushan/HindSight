@@ -1,4 +1,6 @@
 import express from 'express';
+import { MAX_NOTE, SCOPE_ADMIN, SCOPE_SUBMIT, SCOPES, isAdmin } from './admin.js';
+import { adminApi } from './api-v1.js';
 import { MAX_PAGE, REVIEW_STATES } from './db.js';
 import { CATEGORIES, handleMcp } from './mcp.js';
 import { forwardMcp } from './mcp-http.js';
@@ -63,8 +65,9 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
     res.json({ status: config.webReady && config.mcpReady ? 'ok' : 'setup-required', web: config.webReady, mcp: config.mcpReady });
   });
 
-  // ---- MCP: ingestion-only bearer tokens, authenticated before any body parsing or data access.
-  app.all('/api/mcp', async (req, res, next) => {
+  // ---- Bearer-token API: /api/mcp (any valid key) and /api/v1 (admin keys only). Keys are authenticated
+  // before any body parsing or data access; session cookies are never consulted on these routes.
+  const bearer = async (req, res, next) => {
     if (!config.mcpReady) return res.status(503).json({ error: 'setup_required' });
     const match = /^Bearer (hs_[A-Za-z0-9_-]{43})$/.exec(req.get('authorization') || '');
     let token = null;
@@ -87,9 +90,11 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
     }
     req.ingestionToken = token;
     next();
-  }, express.raw({ type: () => true, limit: '32kb' }), async (req, res) => {
+  };
+  app.all('/api/mcp', bearer, express.raw({ type: () => true, limit: '32kb' }), async (req, res) => {
     await forwardMcp(req, res, config.publicOrigin, (request) => handleMcp(store, req.ingestionToken, request));
   });
+  app.use('/api/v1', bearer, adminApi(store));
 
   // ---- Web: Google-protected review UI. Fail closed until fully configured.
   const setupRequired = (_req, res) => res.status(503).send(setupPage());
@@ -156,6 +161,12 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
 
   app.get('/', (_req, res) => res.redirect(303, '/review'));
 
+  // Return to the same filtered view, scrolled to the item.
+  const backToItem = (req) => {
+    const next = typeof req.body.next === 'string' && /^\/review(\?[A-Za-z0-9_.~%&=+-]*)?$/.test(req.body.next) ? req.body.next : '/review';
+    return `${next}#fb-${req.params.id}`;
+  };
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const pick = (v, allowed) => (typeof v === 'string' && allowed.includes(v) ? v : undefined);
   const options = (value, list, any) => (any !== undefined ? `<option value="">${e(any)}</option>` : '') +
     list.map((o) => `<option value="${e(o)}"${o === value ? ' selected' : ''}>${e(o)}</option>`).join('');
@@ -188,6 +199,11 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
 <div class="fb-body"><section><h2 class="label">${icon('bolt')}Friction</h2><div class="prose">${e(f.friction)}</div></section>
 <section><h2 class="label">${icon('bulb')}Improvement</h2><div class="prose">${e(f.improvement)}</div></section></div>
 ${context ? `<dl class="ctx">${context}</dl>` : ''}
+<div class="ctx"><details style="width:100%"${f.review_note ? ' open' : ''}><summary class="label">Review note</summary>
+<form method="post" action="/review/${id}/note"><input type="hidden" name="csrf" value="${csrf}">
+<input type="hidden" name="next" value="${e(here)}"><label class="sr" for="note-${id}">Review note</label>
+<textarea id="note-${id}" name="note" maxlength="${MAX_NOTE}" rows="2">${e(f.review_note ?? '')}</textarea>
+<button class="btn btn-secondary btn-sm" style="margin-top:8px">Save note</button></form></details></div>
 <div class="fb-foot"><span class="reqid">Request <code id="rq-${id}">${e(f.request_id)}</code>${copyButton('rq-' + f.id, 'Copy', 'btn btn-ghost btn-sm')}</span>
 <form method="post" action="/review/${id}/state"><input type="hidden" name="csrf" value="${csrf}">
 <input type="hidden" name="next" value="${e(here)}"><div class="seg" role="group" aria-label="Review state">${stateButtons}</div></form></div></article>`;
@@ -217,13 +233,24 @@ ${filters.state ? `<input type="hidden" name="state" value="${e(filters.state)}"
     const state = pick(req.body.state, REVIEW_STATES);
     if (!/^[0-9a-f-]{36}$/.test(req.params.id) || !state) return problem(req, res, 400, 'Invalid request', 'That review state is not valid.');
     if (!await store.setReviewState(req.reviewer.email, req.params.id, state)) return problem(req, res, 404, 'Not found', 'That feedback item does not exist.');
-    // Return to the same filtered view, scrolled to the item.
-    const next = typeof req.body.next === 'string' && /^\/review(\?[A-Za-z0-9_.~%&=+-]*)?$/.test(req.body.next) ? req.body.next : '/review';
-    res.redirect(303, `${next}#fb-${req.params.id}`);
+    res.redirect(303, backToItem(req));
   });
 
-  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  // The note is private to the owner. Empty clears it. Its own parser: 2000 characters may encode to ~18 KB.
+  const noteForm = express.urlencoded({ extended: false, limit: '24kb' });
+  app.post('/review/:id/note', requireReviewer, noteForm, requireMutation, async (req, res) => {
+    const note = typeof req.body.note === 'string' ? req.body.note.trim() : null;
+    if (!UUID.test(req.params.id) || note === null || note.length > MAX_NOTE || note.includes('\0')) {
+      return problem(req, res, 400, 'Invalid request', `A review note can be up to ${MAX_NOTE} characters.`);
+    }
+    if (!await store.updateFeedback(req.reviewer.email, req.params.id, { note: note || null })) {
+      return problem(req, res, 404, 'Not found', 'That feedback item does not exist.');
+    }
+    res.redirect(303, backToItem(req));
+  });
+
   const EXPIRY = [7, 30, 60, 90];
+  const SCOPE_LABEL = { [SCOPE_SUBMIT]: 'Ingest', [SCOPE_ADMIN]: 'Admin' };
   const tokensPage = async (req, { before, flash = '', created } = {}) => {
     const csrf = e(csrfToken(config.authSecret, req.reviewer.email));
     const { rows, nextCursor } = await store.listTokens(req.reviewer.email, { before });
@@ -234,6 +261,7 @@ ${filters.state ? `<input type="hidden" name="state" value="${e(filters.state)}"
       const revoke = state === 'active' ? `<form method="post" action="/tokens/${e(t.id)}/revoke" data-confirm="Revoke “${e(t.name)}”? Agents using it will stop submitting immediately.">
 <input type="hidden" name="csrf" value="${csrf}"><button class="btn btn-danger btn-sm">Revoke</button></form>` : '';
       return `<li${state === 'active' ? '' : ' class="off"'}><div class="name"><span class="keyico">${icon('key')}</span><b>${e(t.name)}</b>
+<span class="pill${isAdmin(t) ? ' cat' : ''}" title="Scope ${e(t.scope ?? SCOPE_SUBMIT)}">${SCOPE_LABEL[isAdmin(t) ? SCOPE_ADMIN : SCOPE_SUBMIT]}</span>
 <span class="pill ${state}"><span class="dot"></span>${state[0].toUpperCase() + state.slice(1)}</span></div>
 <div class="cell"><span class="k">Created </span>${t.created_at ? when(t.created_at) : '—'}</div>
 <div class="cell"><span class="k">Last used </span>${t.last_used_at ? when(t.last_used_at) : 'Never'}</div>
@@ -241,24 +269,29 @@ ${filters.state ? `<input type="hidden" name="state" value="${e(filters.state)}"
     : `<span class="k">${state === 'expired' ? 'Expired ' : 'Expires '}</span>${when(t.expires_at)}`}</div>
 <div class="act">${revoke}</div></li>`;
     }).join('');
-    const reveal = created ? `<section class="reveal" aria-labelledby="new-key"><h2 id="new-key">${icon('check')}API key “${e(created.name)}” created</h2>
-<p>Copy it now. For your security it will not be shown again.</p>
+    const envVar = created && isAdmin(created) ? 'HINDSIGHT_ADMIN_TOKEN' : 'HINDSIGHT_INGEST_TOKEN';
+    const reveal = created ? `<section class="reveal" aria-labelledby="new-key"><h2 id="new-key">${icon('check')}${SCOPE_LABEL[created.scope]} API key “${e(created.name)}” created</h2>
+<p>Scope <code>${e(created.scope)}</code>: ${isAdmin(created) ? 'it can submit feedback and read and update the review state of your feedback.'
+    : 'it can only submit feedback.'} Copy it now. For your security it will not be shown again.</p>
 <div class="secret"><code id="new-secret">${e(created.plaintext)}</code>${copyButton('new-secret', 'Copy key', 'btn btn-sm')}</div>
 <p style="margin:14px 0 8px">Then store it in the environment of the machine running your agent:</p>
-<div class="code"><pre id="new-env">export HINDSIGHT_INGEST_TOKEN="${e(created.plaintext)}"</pre>${copyButton('new-env')}</div>
+<div class="code"><pre id="new-env">export ${envVar}="${e(created.plaintext)}"</pre>${copyButton('new-env')}</div>
 <div class="next"><a class="btn btn-secondary" href="/connect">${icon('plug')}Set up a client</a></div></section>` : '';
     const createForm = `<form class="card card-pad" method="post" action="/tokens"><input type="hidden" name="csrf" value="${csrf}">
 <h2 style="margin-bottom:12px">Create an API key</h2><div class="form-row">
 <label class="field">Name <input name="name" maxlength="80" required placeholder="e.g. Work laptop — Claude Code" autocomplete="off"></label>
 <label class="field">Expires after <select name="days">${EXPIRY.map((d) => `<option value="${d}"${d === 30 ? ' selected' : ''}>${d} days</option>`).join('')}</select></label>
+<label class="field">Access <select name="scope"><option value="${SCOPE_SUBMIT}" selected>Ingest (submit only)</option>
+<option value="${SCOPE_ADMIN}">Admin (read &amp; manage tasks)</option></select></label>
 <button class="btn" type="submit">${icon('plus')}Create key</button></div>
-<p class="small muted" style="margin:10px 0 0">Keys can only submit feedback. They cannot read your inbox or manage other keys.</p></form>`;
+<p class="small muted" style="margin:10px 0 0">Ingest keys can only submit feedback. Admin keys can also read your feedback and set its
+review state and notes through the API. No key can manage other keys.</p></form>`;
     const listCard = list
       ? `<section class="card" aria-label="Your API keys"><ul class="keys"><li class="hd" aria-hidden="true"><span>Name</span><span>Created</span><span>Last used</span><span>Expires / revoked</span><span></span></li>${list}</ul></section>`
       : emptyState('key', 'No API keys yet', 'Create a key above, then use it to connect Claude Code, Codex, Cursor, or OpenCode.');
     return shell('API keys', flash + reveal + `<div class="stack">${createForm}${listCard}</div>` +
       (pager ? `<nav class="pager" aria-label="Pages">${pager}</nav>` : ''),
-    ui(req, '/tokens', { sub: 'Submit-only keys that let your agents send feedback to this inbox.' }));
+    ui(req, '/tokens', { sub: 'Keys that let your agents send feedback to this inbox, or read and manage it.' }));
   };
 
   app.get('/tokens', requireReviewer, async (req, res) => {
@@ -266,24 +299,26 @@ ${filters.state ? `<input type="hidden" name="state" value="${e(filters.state)}"
     if (before !== undefined && (typeof before !== 'string' || !UUID.test(before))) {
       return problem(req, res, 400, 'Invalid request', 'That page link is not valid.', toTokens);
     }
-    const flash = req.query.revoked === '1' ? alertBox('ok', 'API key revoked. Agents using it can no longer submit feedback.') : '';
+    const flash = req.query.revoked === '1' ? alertBox('ok', 'API key revoked. Agents using it can no longer submit feedback or use the API.') : '';
     res.send(await tokensPage(req, { before, flash }));
   });
 
   app.post('/tokens', requireReviewer, form, requireMutation, async (req, res) => {
     const name = String(req.body.name || '').trim();
     const days = Number(req.body.days || 30);
-    if (!name || name.length > 80 || !Number.isInteger(days) || days < 1 || days > 90) {
-      return res.status(400).send(await tokensPage(req, { flash: alertBox('err', 'Give the key a name (up to 80 characters) and an expiry of 1–90 days.') }));
+    // A missing scope means ingest (the safe default); an unknown one is refused, never widened.
+    const scope = req.body.scope === undefined ? SCOPE_SUBMIT : pick(req.body.scope, SCOPES);
+    if (!name || name.length > 80 || !Number.isInteger(days) || days < 1 || days > 90 || !scope) {
+      return res.status(400).send(await tokensPage(req, { flash: alertBox('err', 'Give the key a name (up to 80 characters), an access level, and an expiry of 1–90 days.') }));
     }
     const plaintext = generateToken();
     // A key has just a name. The stored client label, which attributes and idempotency-binds its
     // submissions, is that name.
     await store.createToken({
-      ownerEmail: req.reviewer.email, name, client: name, tokenHash: hashToken(plaintext),
+      ownerEmail: req.reviewer.email, name, client: name, tokenHash: hashToken(plaintext), scope,
       expiresAt: new Date(Date.now() + days * 86400000),
     });
-    res.send(await tokensPage(req, { created: { name, plaintext } }));
+    res.send(await tokensPage(req, { created: { name, plaintext, scope } }));
   });
 
   app.post('/tokens/:id/revoke', requireReviewer, form, requireMutation, async (req, res) => {

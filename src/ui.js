@@ -57,9 +57,9 @@ h2{font-size:15px;margin:0}
 .btn-block{width:100%}
 label.field{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600;min-width:0}
 label.field .hint{font-weight:400;color:var(--muted)}
-input,select{font:inherit;font-size:14px;font-weight:400;min-height:40px;padding:8px 12px;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);color:var(--text);width:100%;max-width:100%}
-input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.form-row{display:grid;grid-template-columns:minmax(0,1fr) 180px auto;gap:12px;align-items:end}
+input,select,textarea{font:inherit;font-size:14px;font-weight:400;min-height:40px;padding:8px 12px;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);color:var(--text);width:100%;max-width:100%}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.form-row{display:grid;grid-template-columns:minmax(0,1fr) 180px 220px auto;gap:12px;align-items:end}
 .pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;line-height:20px;white-space:nowrap;background:var(--gray-soft);color:var(--muted)}
 .pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
 .pill.new,.pill.active{background:var(--blue-soft);color:var(--blue)}

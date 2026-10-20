@@ -545,6 +545,202 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       assert.equal((await store.listFeedback(owner)).rows.length, 1);
     });
 
+    test('admin and ingest tokens authenticate with their scope', async () => {
+      const owner = 'scope@example.com';
+      const ingest = await token(store, owner);
+      const admin = await token(store, owner, 'ops', 'feedback:admin');
+      assert.equal(ingest.auth.scope, 'feedback:submit');
+      assert.equal(admin.auth.scope, 'feedback:admin');
+      const combined = await store.authenticateAndRateLimit(hashToken(admin.plaintext), [owner], 20);
+      assert.equal(combined.allowed, true);
+      assert.equal(combined.token.scope, 'feedback:admin');
+      assert.deepEqual((await store.listTokens(owner)).rows.map((t) => t.scope).sort(), ['feedback:admin', 'feedback:submit']);
+      await assert.rejects(store.createToken({ ownerEmail: owner, name: 'x', client: 'x', tokenHash: hashToken(generateToken()),
+        expiresAt: day(), scope: 'feedback:all' }), /check constraint/);
+      await store.revokeToken(owner, admin.id);
+      assert.deepEqual(await store.authenticateAndRateLimit(hashToken(admin.plaintext), [owner], 20), { token: null, allowed: false });
+    });
+
+    test('admin feedback listing pages by owner-scoped keyset cursor and filters', async () => {
+      const owner = 'admin-page@example.com';
+      const intruder = 'admin-intruder@example.com';
+      const pool = schemaPool(schema);
+      const a = await token(store, owner, 'laptop');
+      const b = await token(store, owner, 'ci');
+      const ids = [];
+      for (let i = 0; i < 60; i += 1) {
+        const r = await submit(store, i % 3 ? a.auth : b.auth, feedback(`page-${String(i).padStart(4, '0')}`,
+          { category: i % 2 ? 'skills' : 'codebase' }));
+        ids.push(r.id);
+      }
+      // All but the oldest share created_at, so page boundaries rely on the id tiebreak.
+      await pool.query(`UPDATE hindsight_feedback SET created_at = CASE WHEN id = $2
+        THEN now() - interval '2 days' ELSE now() - interval '1 day' END WHERE owner_email = $1`, [owner, ids[0]]);
+      const theirs = await submit(store, (await token(store, intruder)).auth, feedback('page-intruder'));
+
+      const walk = async (filters, limit) => {
+        const seen = [];
+        const cursors = [];
+        let before;
+        do {
+          const { rows, nextCursor } = await store.listFeedbackPage(owner, { ...filters, before, limit });
+          assert.ok(rows.length <= limit);
+          seen.push(...rows.map((r) => r.id));
+          if (nextCursor) { assert.equal(nextCursor, rows.at(-1).id); cursors.push(nextCursor); }
+          before = nextCursor;
+          assert.ok(cursors.length <= 70, 'pagination must terminate');
+        } while (before);
+        return { seen, cursors };
+      };
+      const all = await walk({}, 7);
+      assert.equal(all.seen.length, 60);
+      assert.deepEqual([...all.seen].sort(), [...ids].sort());
+      assert.equal(all.seen.at(-1), ids[0]);
+      assert.equal(all.cursors.length, Math.ceil(60 / 7) - 1);
+
+      assert.equal((await walk({ client: 'ci' }, 25)).seen.length, 20);
+      assert.equal((await walk({ category: 'skills' }, 25)).seen.length, 30);
+      assert.equal((await walk({ category: 'skills', client: 'ci' }, 25)).seen.length, 10);
+      assert.equal(await store.bulkSetReviewState(owner, ids.slice(0, 5), 'triaged').then((r) => r.length), 5);
+      assert.deepEqual((await walk({ state: 'triaged' }, 2)).seen.sort(), ids.slice(0, 5).sort());
+
+      // Limits are clamped in storage too.
+      assert.equal((await store.listFeedbackPage(owner, { limit: 1000 })).rows.length, 60);
+      assert.equal((await store.listFeedbackPage(owner, { limit: 0 })).rows.length, 1);
+      // Cursors are owner-scoped: another owner's or an unknown id yields an empty page.
+      for (const c of all.cursors.slice(0, 3)) {
+        assert.deepEqual(await store.listFeedbackPage(intruder, { before: c }), { rows: [], nextCursor: null });
+      }
+      assert.deepEqual((await store.listFeedbackPage(intruder)).rows.map((r) => r.id), [theirs.id]);
+      assert.deepEqual(await store.listFeedbackPage(owner, { before: theirs.id }), { rows: [], nextCursor: null });
+      assert.deepEqual(await store.listFeedbackPage(owner, { before: '00000000-0000-4000-8000-000000000000' }),
+        { rows: [], nextCursor: null });
+      await assert.rejects(store.listFeedbackPage(owner, { before: 'not-a-uuid' }));
+    });
+
+    test('admin get, update, and bulk are owner-isolated; state timestamps and notes', async () => {
+      const owner = 'admin-update@example.com';
+      const other = 'admin-other@example.com';
+      const pool = schemaPool(schema);
+      const mine = await submit(store, (await token(store, owner)).auth, feedback('upd-00000001'));
+      const mine2 = await submit(store, (await token(store, owner)).auth, feedback('upd-00000002'));
+      const theirs = await submit(store, (await token(store, other)).auth, feedback('upd-00000001'));
+      const raw = async (id) => (await pool.query('SELECT * FROM hindsight_feedback WHERE id = $1', [id])).rows[0];
+
+      assert.equal((await store.getFeedback(owner, mine.id)).id, mine.id);
+      assert.equal(await store.getFeedback(owner, theirs.id), null);
+      assert.equal(await store.getFeedback(owner, '00000000-0000-4000-8000-000000000000'), null);
+      assert.equal(await store.updateFeedback(owner, theirs.id, { state: 'dismissed', note: 'x' }), null);
+      const untouched = await raw(theirs.id);
+      assert.deepEqual([untouched.review_state, untouched.review_note, untouched.reviewed_at], ['new', null, null]);
+
+      const actioned = await store.updateFeedback(owner, mine.id, { state: 'actioned' });
+      assert.equal(actioned.review_state, 'actioned');
+      assert.ok(actioned.reviewed_at && actioned.actioned_at);
+      assert.equal(actioned.dismissed_at, null);
+      await pool.query(`UPDATE hindsight_feedback SET actioned_at = now() - interval '1 hour',
+        reviewed_at = now() - interval '1 hour' WHERE id = $1`, [mine.id]);
+      const before = await raw(mine.id);
+      const again = await store.updateFeedback(owner, mine.id, { state: 'actioned' });
+      assert.equal(again.actioned_at.getTime(), before.actioned_at.getTime()); // re-setting keeps entry time
+      assert.ok(again.reviewed_at > before.reviewed_at);
+      const triaged = await store.updateFeedback(owner, mine.id, { state: 'triaged', note: 'Fixed in skills repo' });
+      assert.equal(triaged.actioned_at.getTime(), before.actioned_at.getTime()); // history kept
+      assert.equal(triaged.review_note, 'Fixed in skills repo');
+      const noteOnly = await store.updateFeedback(owner, mine.id, { note: 'Second thoughts' });
+      assert.deepEqual([noteOnly.review_state, noteOnly.review_note], ['triaged', 'Second thoughts']);
+      assert.equal(noteOnly.reviewed_at.getTime(), triaged.reviewed_at.getTime()); // note alone is not a state change
+      assert.equal((await store.updateFeedback(owner, mine.id, { state: 'new' })).review_note, 'Second thoughts');
+      assert.equal((await store.updateFeedback(owner, mine.id, { note: null })).review_note, null);
+      assert.equal(await store.setReviewState(owner, mine.id, 'dismissed'), true);
+      assert.ok((await raw(mine.id)).dismissed_at);
+      assert.equal(await store.setReviewState(other, mine.id, 'new'), false);
+      // Submitted evidence is never changed by review updates.
+      assert.equal((await raw(mine.id)).friction, feedback('x').friction);
+
+      const unknown = '00000000-0000-4000-8000-000000000000';
+      const updated = await store.bulkSetReviewState(owner, [mine.id, mine2.id, theirs.id, unknown], 'actioned');
+      assert.deepEqual(updated.sort(), [mine.id, mine2.id].sort());
+      assert.equal((await raw(theirs.id)).review_state, 'new');
+      assert.ok((await raw(mine2.id)).actioned_at);
+      assert.deepEqual(await store.bulkSetReviewState(other, [mine.id], 'new'), []);
+      assert.equal((await raw(mine.id)).review_state, 'actioned');
+      await assert.rejects(store.bulkSetReviewState(owner, Array(MAX_BULK + 1).fill(mine.id), 'new'), /bulk_limit/);
+      await assert.rejects(store.bulkSetReviewState(owner, [mine.id], 'deleted'), /check constraint/);
+    });
+
+    test('REST and MCP admin surfaces over real storage: scope, isolation, revocation, removed owner', async () => {
+      const owner = 'owner@example.com';
+      const pool = schemaPool(schema);
+      const admin = await token(store, owner, 'ops', 'feedback:admin');
+      const ingest = await token(store, owner, 'laptop');
+      const mine = await submit(store, ingest.auth, feedback('rest-00000001'));
+      const theirs = await submit(store, (await token(store, 'stranger@example.com')).auth, feedback('rest-00000001'));
+      await pool.query('UPDATE hindsight_ingestion_tokens SET name = client'); // UI-created keys: name == client
+      const config = loadConfig({ ...env, HINDSIGHT_RATE_LIMIT_PER_MINUTE: '600' });
+      const app = createApp({ config, store, getReviewer: async () => null, authRouter: (_req, res) => res.status(404).end() });
+      const auth = (t) => ({ authorization: 'Bearer ' + t.plaintext });
+      const json = { 'content-type': 'application/json' };
+      const rpc = (t, body) => call(base, '/api/mcp', { method: 'POST', headers: { ...auth(t), ...json,
+        accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, ...body }) });
+      let base;
+      await serve(app, async (b) => {
+        base = b;
+        const list = await call(base, '/api/v1/feedback?key=laptop', { headers: auth(admin) });
+        assert.equal(list.status, 200);
+        const page = JSON.parse(list.body);
+        assert.deepEqual(page.items.map((i) => i.id), [mine.id]);
+        assert.equal(page.items[0].key, 'laptop');
+        assert.equal(page.next_cursor, null);
+        assert.equal((await call(base, `/api/v1/feedback/${theirs.id}`, { headers: auth(admin) })).status, 404);
+        const patched = await call(base, `/api/v1/feedback/${mine.id}`, { method: 'PATCH', headers: { ...auth(admin), ...json },
+          body: JSON.stringify({ state: 'actioned', review_note: '  done  ' }) });
+        assert.equal(patched.status, 200);
+        const item = JSON.parse(patched.body);
+        assert.deepEqual([item.state, item.review_note], ['actioned', 'done']);
+        assert.ok(item.actioned_at);
+        const foreign = await call(base, `/api/v1/feedback/${theirs.id}`, { method: 'PATCH', headers: { ...auth(admin), ...json },
+          body: JSON.stringify({ state: 'dismissed' }) });
+        assert.equal(foreign.status, 404);
+        const bulk = await call(base, '/api/v1/feedback/bulk', { method: 'POST', headers: { ...auth(admin), ...json },
+          body: JSON.stringify({ ids: [mine.id, theirs.id], state: 'triaged' }) });
+        assert.deepEqual(JSON.parse(bulk.body), { state: 'triaged', updated: [mine.id], not_found: [theirs.id] });
+        assert.equal((await pool.query('SELECT review_state FROM hindsight_feedback WHERE id = $1', [theirs.id])).rows[0].review_state, 'new');
+
+        // An ingest key is refused on every admin endpoint and keeps exactly one MCP tool.
+        assert.equal((await call(base, '/api/v1/feedback', { headers: auth(ingest) })).status, 403);
+        assert.equal((await call(base, `/api/v1/feedback/${mine.id}`, { method: 'PATCH', headers: { ...auth(ingest), ...json },
+          body: JSON.stringify({ state: 'new' }) })).status, 403);
+        const ingestTools = await rpc(ingest, { method: 'tools/list' });
+        assert.deepEqual([...ingestTools.body.toString().matchAll(/"name":"([a-z_]+)"/g)].map((m) => m[1]), ['submit_feedback']);
+        const adminTools = await rpc(admin, { method: 'tools/list' });
+        for (const name of ['submit_feedback', 'list_feedback', 'get_feedback', 'update_feedback_state', 'bulk_update_feedback_state']) {
+          assert.ok(adminTools.body.toString().includes(`"name":"${name}"`), name);
+        }
+        const got = await rpc(admin, { method: 'tools/call', params: { name: 'get_feedback', arguments: { id: mine.id } } });
+        assert.match(got.body.toString(), /triaged/);
+        const refused = await rpc(ingest, { method: 'tools/call', params: { name: 'get_feedback', arguments: { id: mine.id } } });
+        assert.doesNotMatch(refused.body.toString(), /triaged|Accept relative paths/);
+        // An admin key can also submit.
+        const sub = await rpc(admin, { method: 'tools/call', params: { name: 'submit_feedback', arguments: feedback('rest-00000002') } });
+        assert.match(sub.body.toString(), /Recorded feedback [0-9a-f-]{36} for ops/);
+
+        await store.revokeToken(owner, admin.id);
+        const revoked = await call(base, '/api/v1/feedback', { headers: auth(admin) });
+        assert.equal(revoked.status, 401);
+        assert.deepEqual(JSON.parse(revoked.body), { error: 'invalid_token' });
+      });
+      // A removed owner's admin key gets the same 401, before any throttle write.
+      const second = await token(store, owner, 'ops2', 'feedback:admin');
+      const removed = createApp({ config: loadConfig({ ...env, HINDSIGHT_REVIEWER_EMAILS: 'other@example.com' }), store,
+        getReviewer: async () => null, authRouter: (_req, res) => res.status(404).end() });
+      await serve(removed, async (b) => {
+        assert.equal((await call(b, '/api/v1/feedback', { headers: auth(second) })).status, 401);
+        assert.equal((await call(b, '/api/mcp', { method: 'POST', headers: auth(second) })).status, 401);
+      });
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM hindsight_rate_limits WHERE token_id = $1', [second.id])).rows[0].n, 0);
+    });
+
     test('per-token bounded throttling across windows and concurrent requests', async () => {
       const limit = 3;
       const t = await token(store, 'rate@example.com');
