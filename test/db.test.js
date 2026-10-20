@@ -451,6 +451,39 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       assert.equal(listed.nextCursor, null);
     });
 
+    test('inbox views: multi-state listing and owner-scoped per-state counts honour category and key filters', async () => {
+      const owner = 'views@example.com';
+      const laptop = await token(store, owner, 'laptop');
+      const codex = await token(store, owner, 'codex');
+      const other = await token(store, 'views-other@example.com', 'laptop');
+      const ids = [];
+      for (const [i, [t, category, state]] of [[laptop, 'skills', 'new'], [laptop, 'skills', 'triaged'], [codex, 'codebase', 'actioned'],
+        [codex, 'skills', 'dismissed'], [laptop, 'codebase', 'new']].entries()) {
+        const r = await submit(store, t.auth, feedback(`views-${i}-0001`, { category }));
+        ids.push(r.id);
+        if (state !== 'new') assert.equal(await store.setReviewState(owner, r.id, state), true);
+      }
+      for (let i = 0; i < 3; i += 1) await submit(store, other.auth, feedback(`views-other-${i}-01`));
+      const zero = { new: 0, triaged: 0, actioned: 0, dismissed: 0 };
+      assert.deepEqual(await store.countFeedback(owner), { new: 2, triaged: 1, actioned: 1, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback(owner, { category: 'skills' }), { ...zero, new: 1, triaged: 1, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback(owner, { client: 'codex' }), { ...zero, actioned: 1, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback(owner, { category: 'codebase', client: 'laptop' }), { ...zero, new: 1 });
+      assert.deepEqual(await store.countFeedback('nobody@example.com'), zero);
+      assert.deepEqual(await store.countFeedback('views-other@example.com'), { ...zero, new: 3 });
+      const open = (await store.listFeedback(owner, { states: ['new', 'triaged'] })).rows.map((r) => r.id);
+      assert.deepEqual(open.sort(), [ids[0], ids[1], ids[4]].sort());
+      assert.deepEqual((await store.listFeedback(owner, { states: ['actioned'], client: 'codex' })).rows.map((r) => r.id), [ids[2]]);
+      assert.equal((await store.listFeedback(owner, { states: ['dismissed'], category: 'codebase' })).rows.length, 0);
+      assert.equal((await store.listFeedback(owner, { state: 'triaged' })).rows.length, 1); // single state still works
+      assert.equal((await store.listFeedback(owner)).rows.length, 5);
+      // Bulk via the store the /review/bulk route reuses: only the owner's ids change.
+      const others = (await store.listFeedback('views-other@example.com')).rows.map((r) => r.id);
+      assert.deepEqual((await store.bulkSetReviewState(owner, [ids[0], ids[4], others[0]], 'actioned')).sort(), [ids[0], ids[4]].sort());
+      assert.deepEqual(await store.countFeedback(owner), { new: 0, triaged: 1, actioned: 3, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback('views-other@example.com'), { ...zero, new: 3 });
+    });
+
     test('token keyset paging reaches and revokes the oldest of >100 tokens; cursors are owner-scoped', async () => {
       const owner = 'page@example.com';
       const intruder = 'intruder@example.com';

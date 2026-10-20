@@ -1,4 +1,5 @@
 import { request } from 'node:http';
+import { REVIEW_STATES } from '../src/db.js';
 
 export const ORIGIN = 'https://hs.test';
 export const HOST = 'hs.test';
@@ -77,8 +78,25 @@ export function adminMemory(seed = []) {
     r.review_state = state;
     r.reviewed_at = new Date();
   };
+  const match = (r, { category, state, states, client } = {}) => (!category || r.category === category) &&
+    (!client || r.client === client) && (states ?? (state ? [state] : null) ?? [r.review_state]).includes(r.review_state);
   return {
     adminRows: rows,
+    // Inbox listing (offset pages of 25) and per-state counts, mirroring db.js.
+    async listFeedback(owner, { page = 0, ...f } = {}) {
+      const list = own(owner).filter((r) => match(r, f)).slice(page * 25);
+      return { rows: list.slice(0, 25), hasMore: list.length > 25 };
+    },
+    async countFeedback(owner, { category, client } = {}) {
+      const n = Object.fromEntries(REVIEW_STATES.map((s) => [s, 0]));
+      for (const r of own(owner)) if (match(r, { category, client })) n[r.review_state]++;
+      return n;
+    },
+    async setReviewState(owner, id, state) {
+      const r = own(owner).find((x) => x.id === id);
+      if (r) setState(r, state);
+      return Boolean(r);
+    },
     async listFeedbackPage(owner, { category, state, client, before, limit = 25 } = {}) {
       let list = own(owner);
       if (before !== undefined) {

@@ -107,15 +107,25 @@ export function createPgStore(pool) {
       const same = rows[0].payload_hash === payloadHash && rows[0].client === token.client;
       return { status: same ? 'replayed' : 'conflict', id: rows[0].id, client: rows[0].client };
     },
-    async listFeedback(ownerEmail, { category, state, client, page = 0 } = {}) {
+    // `states` (array) narrows to any of several review states, e.g. the Inbox's Open view (new + triaged);
+    // a single `state` is still accepted.
+    async listFeedback(ownerEmail, { category, state, states, client, page = 0 } = {}) {
       const { rows } = await q(
         `SELECT ${FEEDBACK_COLUMNS} FROM hindsight_feedback
          WHERE owner_email = $1 AND ($2::text IS NULL OR category = $2)
-           AND ($3::text IS NULL OR review_state = $3) AND ($4::text IS NULL OR client = $4)
+           AND ($3::text[] IS NULL OR review_state = ANY($3)) AND ($4::text IS NULL OR client = $4)
          ORDER BY created_at DESC, id DESC LIMIT $5 OFFSET $6`,
-        [ownerEmail, category ?? null, state ?? null, client ?? null, PAGE_SIZE + 1,
+        [ownerEmail, category ?? null, states ?? (state ? [state] : null), client ?? null, PAGE_SIZE + 1,
           Math.min(Math.max(page, 0), MAX_PAGE) * PAGE_SIZE]);
       return { rows: rows.slice(0, PAGE_SIZE), hasMore: rows.length > PAGE_SIZE };
+    },
+    // Per-state totals for the owner's Inbox tabs, honouring the category/key filters. Every state is present.
+    async countFeedback(ownerEmail, { category, client } = {}) {
+      const { rows } = await q(
+        `SELECT review_state, count(*)::int AS n FROM hindsight_feedback
+         WHERE owner_email = $1 AND ($2::text IS NULL OR category = $2) AND ($3::text IS NULL OR client = $3)
+         GROUP BY review_state`, [ownerEmail, category ?? null, client ?? null]);
+      return Object.fromEntries(REVIEW_STATES.map((s) => [s, rows.find((r) => r.review_state === s)?.n ?? 0]));
     },
     // Admin listing: keyset pagination, newest first, like listTokens. The cursor (the last id on the
     // previous page) is resolved inside the owner-scoped subquery, so a foreign or unknown id yields no rows.
