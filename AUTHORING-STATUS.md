@@ -75,6 +75,46 @@ and collaboration, as well as tools and connectors.
   with Google" was redirected to `accounts.google.com` with the canonical `redirect_uri`. A real Google round trip is
   still untested.
 
+## Admin keys (authored and run locally in this session; not yet operator-verified)
+
+Branch `revamp/checklist-admin-keys`. Purpose: let the owner read and act on their feedback programmatically.
+
+- **Scopes.** `migrations/005_admin_scope.sql` widens the token `scope` check additively to
+  `feedback:submit` (ingest, still the default) and `feedback:admin`. Decision: an admin key can do
+  everything (submit, read, update state/note); an ingest key can only submit. Anything other than the
+  exact admin scope is treated as ingest in code (`src/admin.js`).
+- **Same gate.** `/api/mcp` and the new `/api/v1` share one bearer middleware: setup-required, canonical
+  HTTPS host gate, foreign `Origin` refusal, token validity (expiry/revocation), owner allowlist, and the
+  durable per-key rate limit. Session cookies are never consulted there. Admin operations use the token's
+  normalized, allow-listed owner, so isolation matches `/review`.
+- **MCP.** Ingest keys still list exactly `submit_feedback`. Admin keys also get `list_feedback`
+  (state/category/key filters, limit ≤ 100, keyset cursor), `get_feedback`, `update_feedback_state`
+  (optional `review_note`), and `bulk_update_feedback_state` (≤ 100 ids). Tool descriptions flag item text
+  as untrusted. Storage errors return a generic error.
+- **REST.** `GET /api/v1/feedback`, `GET`/`PATCH /api/v1/feedback/:id`, `POST /api/v1/feedback/bulk`
+  (`src/api-v1.js`), with zod-validated strict query and body handling. Status codes: 401
+  `invalid_token`, 403 `insufficient_scope`, 400 `invalid_request`, 404 `not_found` (including another
+  owner's id), 413/415, 429, 503.
+- **Storage** (`src/db.js`). `listFeedbackPage` (keyset cursor resolved in the owner-scoped subquery),
+  `getFeedback`, `updateFeedback`, and `bulkSetReviewState` (one atomic UPDATE). New nullable
+  `actioned_at`/`dismissed_at` record when an item last entered that state. `review_note` (1–2000) is
+  settable through the API, MCP, and a small CSRF-protected form on `/review` (`POST /review/:id/note`).
+  `CATEGORIES`/`OUTCOMES` moved to `db.js` (re-exported from `mcp.js`) to avoid an import cycle.
+- **UI** (minimal; the restyle is a separate task). `/tokens` has an Access select (Ingest / Admin), a scope
+  pill in the list, and the scope plus `HINDSIGHT_ADMIN_TOKEN` on the reveal. `/review` cards have a
+  collapsible note form. CSS: `textarea` joins the input styles, and `.form-row` gains one column.
+- **Tests.** In-memory admin store mirror in `test/helpers.js`. `test/mcp.test.js` covers the tool catalog
+  and schemas, ingest refusal, paging and filters, isolation, errors, and the gated official client.
+  `test/app.test.js` covers the REST gate (setup, canonical, origin, cookies ignored, 401/403/429/503),
+  validation, paging, isolation, the token scope UI, and review notes. `test/db.test.js` covers the 005
+  migration over pre-existing data, scope auth, keyset paging over 60 items with ties, get/update/bulk
+  isolation and timestamps, and REST plus MCP end to end on PostgreSQL, including revoked and
+  removed-owner admin keys. The rollback fixture moved from `005` to the unused version `900`.
+  `scripts/migrate.js` needed no change: checksums are computed from the files and `--verify-files` lists 005.
+- **Run in this session.** `npm run check` passed. `npm test` passed 75/75 without a DB. `npm run test:db`
+  passed 29/29 on a local disposable PostgreSQL 16 `hindsight_test`. A manual curl run against a live
+  server on PostgreSQL also passed (list, cursor, PATCH, bulk, ingest key `403`, non-canonical `421`).
+
 ## Operator-run diagnostics (reported to the author, not run by the author)
 
 - slice004: clean install, syntax check, 41 tests, and `npm audit` (0) passed. Manual checks on isolated
@@ -95,3 +135,5 @@ and collaboration, as well as tools and connectors.
 - [ ] Tomorrow: configure the existing approved PostgreSQL resource (dedicated `hindsight_*` tables),
       real Google/session/reviewer config, custom domain, explicit migration (README checklist).
 - [ ] Not yet tested: real Google sign-in, any of the four MCP client configs end to end, production persistence.
+- [ ] Operator: apply `005` (`npm run migrate` plan must list only it), then run README checklist step 9 (admin key).
+- [ ] Reviewer: browser check of the `/tokens` Access select and the `/review` note form (restyle pending).
