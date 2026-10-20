@@ -1,13 +1,13 @@
 import express from 'express';
-import { MAX_NOTE, SCOPE_ADMIN, SCOPE_SUBMIT, SCOPES, isAdmin } from './admin.js';
+import { MAX_BULK, MAX_NOTE, SCOPE_ADMIN, SCOPE_SUBMIT, SCOPES, bulkUpdate, isAdmin } from './admin.js';
 import { adminApi } from './api-v1.js';
 import { MAX_PAGE, REVIEW_STATES } from './db.js';
 import { CATEGORIES, handleMcp } from './mcp.js';
 import { forwardMcp } from './mcp-http.js';
 import { canonicalHeadersOk, checkCsrf, csrfToken, escapeHtml as e, generateToken, hashToken, safeRelativePath, sameOrigin } from './security.js';
-import { GOOGLE_G, SCRIPT_HASH, alertBox, copyButton, emptyState, icon, shell, solo, when } from './ui.js';
+import { GOOGLE_G, SCRIPT_HASH, ago, alertBox, copyButton, dayDiff, emptyState, icon, shell, solo, when } from './ui.js';
 
-const setupPage = () => solo('Setup required', `<div style="text-align:left"><p>HindSight collects the improvement notes your agents
+const setupPage = () => solo('Setup required', `<div class="prose-left"><p>HindSight collects the improvement notes your agents
 submit about your shared instructions, skills, codebase, collaboration, and tools.</p>
 <p>This deployment is not ready yet: sign-in, storage, and reviewer access have not all been configured. Until they are,
 sign-in, review, and feedback submission stay switched off.</p></div>
@@ -123,7 +123,7 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
 <input type="hidden" name="callbackUrl" value="${e(callbackUrl)}">
 <button class="gbtn" type="submit">${GOOGLE_G}<span>Continue with Google</span></button></form>
 <p class="fine">${icon('shield')} Only allow-listed reviewer accounts can sign in.</p>`,
-    { sub: 'Review the improvement notes your agents send about your instructions, skills, codebase, and tools.' }));
+    { sub: 'Review what your agents suggest you change in your instructions, skills, codebase, and tools.' }));
   });
 
   app.get(/^\/auth\/signout\/?$/, async (req, res, next) => {
@@ -147,8 +147,8 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
     next();
   };
   const problem = (req, res, status, title, text, back = ['/review', 'Back to inbox']) =>
-    res.status(status).send(shell(title, `<div class="card card-pad"><p style="margin-top:0">${text}</p>
-<a class="btn btn-secondary" href="${back[0]}">${e(back[1])}</a></div>`, { user: req.reviewer }));
+    res.status(status).send(shell(title, `<div class="card card-pad problem">${icon('alert')}<div><p>${text}</p>
+<a class="btn btn-secondary btn-sm" href="${e(back[0])}">${e(back[1])}</a></div></div>`, { user: req.reviewer }));
   const toTokens = ['/tokens', 'Back to API keys'];
   const requireMutation = (req, res, next) => {
     if (!sameOrigin(req, config.publicOrigin) || !checkCsrf(config.authSecret, req.reviewer.email, req.body?.csrf)) {
@@ -161,79 +161,163 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
 
   app.get('/', (_req, res) => res.redirect(303, '/review'));
 
-  // Return to the same filtered view, scrolled to the item.
-  const backToItem = (req) => {
-    const next = typeof req.body.next === 'string' && /^\/review(\?[A-Za-z0-9_.~%&=+-]*)?$/.test(req.body.next) ? req.body.next : '/review';
-    return `${next}#fb-${req.params.id}`;
-  };
+  // Return to the same filtered view, scrolled to the item (or to its note form).
+  const NEXT = /^\/review(\?[A-Za-z0-9_.~%&=+-]*)?$/;
+  const nextOf = (req) => (typeof req.body.next === 'string' && NEXT.test(req.body.next) ? req.body.next : '/review');
+  const backToItem = (req, anchor = 'fb') => `${nextOf(req)}#${anchor}-${req.params.id}`;
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const pick = (v, allowed) => (typeof v === 'string' && allowed.includes(v) ? v : undefined);
   const options = (value, list, any) => (any !== undefined ? `<option value="">${e(any)}</option>` : '') +
     list.map((o) => `<option value="${e(o)}"${o === value ? ' selected' : ''}>${e(o)}</option>`).join('');
-  const STATE_LABEL = { new: 'New', triaged: 'Triaged', actioned: 'Actioned', dismissed: 'Dismissed' };
+
+  // The Inbox is a checklist. Views map onto DB states: Open = new + triaged (Planned), Done = actioned,
+  // Won't do = dismissed. The old ?state=<db state> links still work: actioned/dismissed open their view,
+  // new/triaged narrow the Open view to that one state.
+  const VIEWS = { open: ['new', 'triaged'], done: ['actioned'], wontdo: ['dismissed'], all: undefined };
+  const VIEW_LABEL = { open: 'Open', done: 'Done', wontdo: 'Won’t do', all: 'All' };
+  const VIEW_OF = { new: 'open', triaged: 'open', actioned: 'done', dismissed: 'wontdo' };
+  const STATE_NAME = { new: 'Open', triaged: 'Planned', actioned: 'Done', dismissed: 'Won’t do' };
+  const GROUPS = ['category', 'none'];
+  const STATE_PARAMS = [...Object.keys(VIEWS), ...REVIEW_STATES];
+  // [state, label, icon, primary] buttons offered for an item in each state.
+  const ACTIONS = {
+    new: [['triaged', 'Plan', 'target'], ['dismissed', 'Won’t do', 'x'], ['actioned', 'Mark done', 'check', true]],
+    triaged: [['new', 'Unplan', 'undo'], ['dismissed', 'Won’t do', 'x'], ['actioned', 'Mark done', 'check', true]],
+    actioned: [['new', 'Reopen', 'undo'], ['dismissed', 'Won’t do', 'x']],
+    dismissed: [['new', 'Reopen', 'undo'], ['actioned', 'Mark done', 'check']],
+  };
+  const MENU = { new: ACTIONS.new.slice(0, 2), triaged: ACTIONS.triaged.slice(0, 2), actioned: ACTIONS.actioned, dismissed: ACTIONS.dismissed.slice(0, 1) };
 
   app.get('/review', requireReviewer, async (req, res) => {
+    const state = pick(req.query.state, STATE_PARAMS);
+    const view = VIEW_OF[state] ?? state ?? 'open';
+    const narrow = state === 'new' || state === 'triaged' ? state : undefined;
     const filters = {
       category: pick(req.query.category, CATEGORIES),
-      state: pick(req.query.state, REVIEW_STATES),
+      states: narrow ? [narrow] : VIEWS[view],
       client: typeof req.query.client === 'string' && /^.{1,80}$/.test(req.query.client) ? req.query.client : undefined,
       page: Math.min(Math.max(Number.parseInt(req.query.page, 10) || 0, 0), MAX_PAGE),
     };
-    const [{ rows, hasMore }, keys] = await Promise.all([
-      store.listFeedback(req.reviewer.email, filters),
-      store.listTokens(req.reviewer.email, {}),
+    const group = pick(req.query.group, GROUPS) ?? 'date';
+    const select = req.query.select === '1';
+    const owner = req.reviewer.email;
+    const [{ rows, hasMore }, counts, keys] = await Promise.all([
+      store.listFeedback(owner, filters),
+      store.countFeedback(owner, { category: filters.category, client: filters.client }),
+      store.listTokens(owner, {}),
     ]);
-    const csrf = e(csrfToken(config.authSecret, req.reviewer.email));
-    const qs = (over) => '/review?' + new URLSearchParams(Object.entries({ ...filters, page: String(filters.page), ...over })
-      .filter(([, v]) => v !== undefined && v !== '' && v !== '0')).toString();
+    const csrf = e(csrfToken(config.authSecret, owner));
+    const params = { state: state === 'open' ? undefined : state, category: filters.category, client: filters.client,
+      group: group === 'date' ? undefined : group, page: String(filters.page), select: select ? '1' : undefined };
+    const qs = (over) => '/review' + ((q) => (q ? '?' + q : ''))(new URLSearchParams(Object.entries({ ...params, ...over })
+      .filter(([, v]) => v !== undefined && v !== '' && v !== '0')).toString());
     const here = qs({});
-    const ctx = (label, v) => (v ? `<div><dt>${label}</dt><dd>${e(v)}</dd></div>` : '');
-    const items = rows.map((f) => {
-      const id = e(f.id);
-      const stateButtons = REVIEW_STATES.map((s) => `<button name="state" value="${s}" aria-pressed="${s === f.review_state}">${STATE_LABEL[s]}</button>`).join('');
-      const context = ctx('Repository', f.repository) + ctx('Task', f.task) + ctx('Source', f.source) +
-        ctx('Outcome', f.outcome) + ctx('Confidence', f.confidence);
-      return `<article class="card fb" id="fb-${id}"><div class="fb-top"><span class="pill cat">${e(f.category)}</span>
-<span class="pill ${e(f.review_state)}"><span class="dot"></span>${e(STATE_LABEL[f.review_state] || f.review_state)}</span>
-<span class="src">${icon('bot')}${e(f.client)}</span>${when(f.created_at)}</div>
-<div class="fb-body"><section><h2 class="label">${icon('bolt')}Friction</h2><div class="prose">${e(f.friction)}</div></section>
-<section><h2 class="label">${icon('bulb')}Improvement</h2><div class="prose">${e(f.improvement)}</div></section></div>
-${context ? `<dl class="ctx">${context}</dl>` : ''}
-<div class="ctx"><details style="width:100%"${f.review_note ? ' open' : ''}><summary class="label">Review note</summary>
-<form method="post" action="/review/${id}/note"><input type="hidden" name="csrf" value="${csrf}">
-<input type="hidden" name="next" value="${e(here)}"><label class="sr" for="note-${id}">Review note</label>
-<textarea id="note-${id}" name="note" maxlength="${MAX_NOTE}" rows="2">${e(f.review_note ?? '')}</textarea>
-<button class="btn btn-secondary btn-sm" style="margin-top:8px">Save note</button></form></details></div>
-<div class="fb-foot"><span class="reqid">Request <code id="rq-${id}">${e(f.request_id)}</code>${copyButton('rq-' + f.id, 'Copy', 'btn btn-ghost btn-sm')}</span>
-<form method="post" action="/review/${id}/state"><input type="hidden" name="csrf" value="${csrf}">
-<input type="hidden" name="next" value="${e(here)}"><div class="seg" role="group" aria-label="Review state">${stateButtons}</div></form></div></article>`;
-    }).join('');
+    const hidden = (name, value) => `<input type="hidden" name="${name}" value="${e(value)}">`;
+    const stateForm = (id, cls, inner) => `<form${cls ? ` class="${cls}"` : ''} method="post" action="/review/${id}/state">${hidden('csrf', csrf)}${hidden('next', here)}${inner}</form>`;
+    const fact = (label, v) => (v ? `<div><dt>${label}</dt><dd>${e(v)}</dd></div>` : '');
+    const SEP = '<span class="sep">·</span>';
 
-    const tabs = [[undefined, 'All'], ...REVIEW_STATES.map((s) => [s, STATE_LABEL[s]])].map(([s, label]) =>
-      `<a href="${e(qs({ state: s, page: '0' }))}"${s === filters.state ? ' aria-current="page"' : ''}>${label}</a>`).join('');
+    const row = (f) => {
+      const id = e(f.id);
+      const s = f.review_state;
+      const done = s === 'actioned';
+      const glyph = s === 'triaged' ? ' planned' : s === 'dismissed' ? ' wontdo' : '';
+      const label = done ? 'Reopen' : s === 'dismissed' ? 'Reopen (currently won’t do)' : s === 'triaged' ? 'Mark done (currently planned)' : 'Mark done';
+      const box = `<span class="box">${icon('check')}</span>`;
+      const lead = select
+        ? `<label class="sel"><input type="checkbox" name="ids" value="${id}" form="bulk" aria-label="Select: ${e(f.improvement.slice(0, 80))}">${box}</label>`
+        : stateForm(id, 'chk-form', `<button class="chk${glyph}" type="submit" name="state" value="${done || s === 'dismissed' ? 'new' : 'actioned'}" role="checkbox" aria-checked="${done}" aria-label="${label}">${box}</button>`);
+      const tag = s === 'triaged' ? `<span class="tag planned">Planned</span>${SEP}` : s === 'dismissed' ? `<span class="tag wontdo">Won’t do</span>${SEP}` : '';
+      const note = f.review_note ? `${SEP}<span class="tag hasnote">Has note</span>` : '';
+      const facts = fact('Repository', f.repository) + fact('Task', f.task) + fact('Source', f.source) + fact('Outcome', f.outcome) + fact('Confidence', f.confidence);
+      const buttons = ACTIONS[s] ?? ACTIONS.new;
+      const actions = stateForm(id, 'actions', buttons.map(([to, text, ico, primary]) =>
+        `<button class="btn${primary ? '' : ' btn-secondary'} btn-sm" name="state" value="${to}">${icon(ico)}${text}</button>`).join(''));
+      const menu = select ? '<span></span>' : `<details class="menu"><summary aria-label="More actions">${icon('dots')}</summary><div class="menu-panel">
+${stateForm(id, '', (MENU[s] ?? MENU.new).map(([to, text, ico]) => `<button name="state" value="${to}">${icon(ico)}${text}</button>`).join(''))}<hr>
+<a href="${e(qs({ client: f.client, page: '0' }))}">${icon('key')}Only this API key</a><button type="button" class="copy" data-copy="rq-${id}">${icon('copy')}<span class="copy-label">Copy request id</span></button></div></details>`;
+      return `<li class="task is-${{ new: 'open', triaged: 'planned', actioned: 'done', dismissed: 'wontdo' }[s] ?? 'open'}" id="fb-${id}">${lead}
+<details class="body"><summary><span class="title">${e(f.improvement)}</span>
+<span class="meta">${tag}<span class="cat">${e(f.category)}</span>${SEP}<span class="src">${e(f.client)}</span>${SEP}${ago(f.created_at)}${note}<span class="chev"><span>Details</span>${icon('chev')}</span></span></summary>
+<div class="detail"><h3>Friction</h3><p class="prose">${e(f.friction)}</p>${facts ? `<dl class="facts">${facts}</dl>` : ''}
+<form class="note" id="nt-${id}" method="post" action="/review/${id}/note">${hidden('csrf', csrf)}${hidden('next', here)}
+<label for="note-${id}">Review note <span>· private to you</span></label><textarea id="note-${id}" name="note" maxlength="${MAX_NOTE}" rows="${f.review_note ? 3 : 1}" placeholder="Add a note…">${e(f.review_note ?? '')}</textarea>
+<button class="btn btn-secondary btn-sm">Save note</button></form>
+<div class="detail-foot"><span class="reqid">Request <code id="rq-${id}">${e(f.request_id)}</code>${copyButton('rq-' + f.id, 'Copy', 'btn btn-ghost btn-sm')}</span>${actions}</div></div></details>
+${menu}</li>`;
+    };
+
+    // Groups on this page: by UTC day (Today / Yesterday / Earlier), by category, or none.
+    const groups = new Map();
+    for (const f of rows) {
+      const days = dayDiff(f.created_at);
+      const key = group === 'none' ? '' : group === 'category' ? f.category : days <= 0 ? 'Today' : days === 1 ? 'Yesterday' : 'Earlier';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
+    }
+    const order = group === 'category' ? CATEGORIES.filter((c) => groups.has(c)) : [...groups.keys()];
+    const list = order.map((k) => (k ? `<h2 class="group">${e(k)} <span class="n">${groups.get(k).length}</span></h2>` : '') +
+      `<ul class="tasks">${groups.get(k).map(row).join('')}</ul>`).join('');
+
+    const n = { open: counts.new + counts.triaged, done: counts.actioned, wontdo: counts.dismissed,
+      all: REVIEW_STATES.reduce((t, s) => t + counts[s], 0) };
+    const tabs = Object.keys(VIEWS).map((v) => `<a href="${e(qs({ state: v === 'open' ? undefined : v, page: '0' }))}"${v === view ? ' aria-current="page"' : ''}>${VIEW_LABEL[v]} <span class="n">${n[v]}</span></a>`).join('');
     const clients = [...new Set([...keys.rows.map((t) => t.client), ...(filters.client ? [filters.client] : [])])];
-    const toolbar = `<div class="toolbar"><nav class="seg" aria-label="Review state">${tabs}</nav>
-<form class="filters" method="get" action="/review" role="search" aria-label="Filter feedback">
-${filters.state ? `<input type="hidden" name="state" value="${e(filters.state)}">` : ''}
-<label class="sr" for="f-cat">Category</label><select id="f-cat" name="category" data-autosubmit>${options(filters.category, CATEGORIES, 'All categories')}</select>
-<label class="sr" for="f-key">API key</label><select id="f-key" name="client" data-autosubmit>${options(filters.client, clients, 'All API keys')}</select>
-<button class="btn btn-secondary btn-sm apply">Apply</button></form></div>`;
-    const filtered = filters.category || filters.state || filters.client;
-    const empty = filtered
-      ? emptyState('inbox', 'Nothing matches these filters', 'Try another state, category, or API key.', '<a class="btn btn-secondary" href="/review">Clear filters</a>')
-      : emptyState('inbox', 'No feedback yet', 'When an agent connected with one of your API keys finishes a task, its improvement notes land here.',
-        `<a class="btn" href="/connect">${icon('plug')}Connect a client</a>`);
+    const toolbar = `<div class="toolbar"><nav class="views" aria-label="View">${tabs}</nav>
+${select ? '' : `<a class="btn btn-ghost btn-sm" href="${e(qs({ select: '1' }))}">${icon('list')}Select</a>`}</div>
+<form class="filters" method="get" action="/review" role="search" aria-label="Filter items">
+${params.state ? hidden('state', params.state) : ''}${select ? hidden('select', '1') : ''}
+<label class="sr" for="f-cat">Category</label><select id="f-cat" name="category" data-autosubmit>${options(filters.category, CATEGORIES, 'Category: all')}</select>
+<label class="sr" for="f-key">API key</label><select id="f-key" name="client" data-autosubmit>${options(filters.client, clients, 'API key: all')}</select>
+<label class="sr" for="f-grp">Group by</label><select id="f-grp" name="group" data-autosubmit><option value="">Group: date</option>
+<option value="category"${group === 'category' ? ' selected' : ''}>Group: category</option><option value="none"${group === 'none' ? ' selected' : ''}>No grouping</option></select>
+<button class="btn btn-secondary btn-sm apply">Apply</button></form>
+${narrow ? `<p class="narrow">Showing only ${STATE_NAME[narrow]} items.<a href="${e(qs({ state: undefined, page: '0' }))}">Show all open</a></p>` : ''}`;
+    const bulkbar = select ? `<form id="bulk" class="bulkbar" method="post" action="/review/bulk" role="group" aria-label="Bulk actions">
+${hidden('csrf', csrf)}${hidden('next', qs({ select: undefined }))}<span class="count" data-count aria-live="polite">Select items</span>
+<button class="btn btn-sm" name="state" value="actioned">${icon('check')}Mark done</button>
+<button class="btn btn-secondary btn-sm" name="state" value="triaged">${icon('target')}Plan</button>
+<button class="btn btn-secondary btn-sm" name="state" value="dismissed">${icon('x')}Won’t do</button><span class="spacer"></span>
+<a class="btn btn-ghost btn-sm" href="${e(qs({ select: undefined }))}">Cancel</a></form>` : '';
+
+    let empty = '';
+    if (!rows.length) {
+      empty = n.all === 0 && !filters.category && !filters.client
+        ? emptyState('inbox', 'No feedback yet', 'When an agent connected with one of your API keys finishes a task, its suggestions land here.',
+          `<a class="btn" href="/connect">${icon('plug')}Connect a client</a>`)
+        : filters.category || filters.client
+          ? emptyState('', 'Nothing matches these filters', 'Try another category or API key.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ category: undefined, client: undefined, page: '0' }))}">Clear filters</a>`)
+          : view === 'open' && !narrow && !filters.page
+            ? emptyState('', 'All clear', 'Nothing open. New suggestions land here when an agent finishes a task.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ state: 'done', page: '0' }))}">See what’s done</a>`)
+            : emptyState('', 'Nothing here', 'No items in this view.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ state: 'all', page: '0' }))}">Show all</a>`);
+    }
     const pager = (filters.page > 0 ? `<a class="btn btn-secondary btn-sm" href="${e(qs({ page: String(filters.page - 1) }))}">Newer</a>` : '') +
       (hasMore && filters.page < MAX_PAGE ? `<a class="btn btn-secondary btn-sm" href="${e(qs({ page: String(filters.page + 1) }))}">Older</a>` : '');
-    res.send(shell('Inbox', toolbar + (items ? `<div class="feed">${items}</div>` : empty) + (pager ? `<nav class="pager" aria-label="Pages">${pager}</nav>` : ''),
-      ui(req, '/review', { sub: 'Improvement notes from your agents. Each one is attributable to the API key that sent it: private to you, not anonymous.' })));
+    res.send(shell('Inbox', toolbar + bulkbar + (list || empty) + (pager ? `<nav class="pager" aria-label="Pages">${pager}</nav>` : ''),
+      ui(req, '/review', { sub: 'What your agents suggest you change. Tick an item when it is done. Each item is attributable to the API key that sent it.' })));
   });
 
   app.post('/review/:id/state', requireReviewer, form, requireMutation, async (req, res) => {
     const state = pick(req.body.state, REVIEW_STATES);
-    if (!/^[0-9a-f-]{36}$/.test(req.params.id) || !state) return problem(req, res, 400, 'Invalid request', 'That review state is not valid.');
+    if (!UUID.test(req.params.id) || !state) return problem(req, res, 400, 'Invalid request', 'That review state is not valid.');
     if (!await store.setReviewState(req.reviewer.email, req.params.id, state)) return problem(req, res, 404, 'Not found', 'That feedback item does not exist.');
     res.redirect(303, backToItem(req));
+  });
+
+  // Bulk select mode: one form, up to MAX_BULK owner-scoped ids, one atomic store update. Ids that are not the
+  // owner's (or unknown) are skipped by the owner-scoped UPDATE. Its own parser: 100 ids are ~4.2 KB encoded.
+  const bulkForm = express.urlencoded({ extended: false, limit: '16kb', parameterLimit: MAX_BULK + 10 });
+  app.post('/review/bulk', requireReviewer, bulkForm, requireMutation, async (req, res) => {
+    const state = pick(req.body.state, REVIEW_STATES);
+    const ids = [req.body.ids ?? []].flat();
+    if (!state || !ids.every((id) => typeof id === 'string' && UUID.test(id))) {
+      return problem(req, res, 400, 'Invalid request', 'That bulk change is not valid.');
+    }
+    if (!ids.length || ids.length > MAX_BULK) {
+      return problem(req, res, 400, 'Invalid request', `Select between 1 and ${MAX_BULK} items.`, [nextOf(req) + (nextOf(req).includes('?') ? '&' : '?') + 'select=1', 'Back to selection']);
+    }
+    await bulkUpdate(store, req.reviewer.email, ids, state);
+    res.redirect(303, nextOf(req));
   });
 
   // The note is private to the owner. Empty clears it. Its own parser: 2000 characters may encode to ~18 KB.
@@ -246,52 +330,63 @@ ${filters.state ? `<input type="hidden" name="state" value="${e(filters.state)}"
     if (!await store.updateFeedback(req.reviewer.email, req.params.id, { note: note || null })) {
       return problem(req, res, 404, 'Not found', 'That feedback item does not exist.');
     }
-    res.redirect(303, backToItem(req));
+    res.redirect(303, backToItem(req, 'nt'));
   });
 
   const EXPIRY = [7, 30, 60, 90];
-  const SCOPE_LABEL = { [SCOPE_SUBMIT]: 'Ingest', [SCOPE_ADMIN]: 'Admin' };
-  const tokensPage = async (req, { before, flash = '', created } = {}) => {
+  const tokensPage = async (req, { before, flash = '', created, form: posted = {} } = {}) => {
     const csrf = e(csrfToken(config.authSecret, req.reviewer.email));
     const { rows, nextCursor } = await store.listTokens(req.reviewer.email, { before });
     const pager = (before ? '<a class="btn btn-secondary btn-sm" href="/tokens">Newest</a>' : '') +
       (nextCursor ? `<a class="btn btn-secondary btn-sm" href="${e('/tokens?before=' + nextCursor)}">Older</a>` : '');
     const list = rows.map((t) => {
       const state = t.revoked_at ? 'revoked' : new Date(t.expires_at) <= new Date() ? 'expired' : 'active';
-      const revoke = state === 'active' ? `<form method="post" action="/tokens/${e(t.id)}/revoke" data-confirm="Revoke “${e(t.name)}”? Agents using it will stop submitting immediately.">
-<input type="hidden" name="csrf" value="${csrf}"><button class="btn btn-danger btn-sm">Revoke</button></form>` : '';
-      return `<li${state === 'active' ? '' : ' class="off"'}><div class="name"><span class="keyico">${icon('key')}</span><b>${e(t.name)}</b>
-<span class="pill${isAdmin(t) ? ' cat' : ''}" title="Scope ${e(t.scope ?? SCOPE_SUBMIT)}">${SCOPE_LABEL[isAdmin(t) ? SCOPE_ADMIN : SCOPE_SUBMIT]}</span>
-<span class="pill ${state}"><span class="dot"></span>${state[0].toUpperCase() + state.slice(1)}</span></div>
+      const admin = isAdmin(t);
+      const confirm = admin ? `Revoke “${t.name}”? Anything using it loses access immediately.`
+        : `Revoke “${t.name}”? Agents using it will stop submitting immediately.`;
+      const revoke = state === 'active' ? `<form method="post" action="/tokens/${e(t.id)}/revoke" data-confirm="${e(confirm)}">
+<input type="hidden" name="csrf" value="${csrf}"><button class="btn btn-danger btn-sm" aria-label="Revoke ${e(t.name)}">Revoke</button></form>` : '';
+      const cls = [admin && 'is-admin', state !== 'active' && 'off'].filter(Boolean).join(' ');
+      return `<li${cls ? ` class="${cls}"` : ''}><div class="name"><span class="keyico${admin ? ' admin' : ''}">${icon(admin ? 'shield' : 'key')}</span><span class="nm"><b>${e(t.name)}</b>
+<span class="status ${state}">${state[0].toUpperCase() + state.slice(1)}</span></span></div>
+<div class="cell"><span class="scopelbl${admin ? ' admin' : ''}" title="Scope ${e(admin ? SCOPE_ADMIN : SCOPE_SUBMIT)}">${admin ? icon('shield') + 'Admin' : 'Ingest'}</span></div>
 <div class="cell"><span class="k">Created </span>${t.created_at ? when(t.created_at) : '—'}</div>
 <div class="cell"><span class="k">Last used </span>${t.last_used_at ? when(t.last_used_at) : 'Never'}</div>
 <div class="cell">${state === 'revoked' ? `Revoked ${t.revoked_at ? when(t.revoked_at) : ''}`
     : `<span class="k">${state === 'expired' ? 'Expired ' : 'Expires '}</span>${when(t.expires_at)}`}</div>
 <div class="act">${revoke}</div></li>`;
     }).join('');
-    const envVar = created && isAdmin(created) ? 'HINDSIGHT_ADMIN_TOKEN' : 'HINDSIGHT_INGEST_TOKEN';
-    const reveal = created ? `<section class="reveal" aria-labelledby="new-key"><h2 id="new-key">${icon('check')}${SCOPE_LABEL[created.scope]} API key “${e(created.name)}” created</h2>
-<p>Scope <code>${e(created.scope)}</code>: ${isAdmin(created) ? 'it can submit feedback and read and update the review state of your feedback.'
-    : 'it can only submit feedback.'} Copy it now. For your security it will not be shown again.</p>
+    const adminCreated = created && isAdmin(created);
+    const reveal = !created ? '' : `<section class="reveal${adminCreated ? ' admin' : ''}" aria-labelledby="new-key">
+<h2 id="new-key">${icon(adminCreated ? 'shield' : 'check')}${adminCreated ? 'Admin' : 'Ingest'} key “${e(created.name)}” created</h2>
+<p>Scope <code>${e(created.scope)}</code>. Copy it now. For your security it will not be shown again.</p>
+${adminCreated ? `<div class="warnline">${icon('warn')}<span>This key can read every item in your inbox and change its state. Keep it out of agent configs and shared machines; revoke it the moment it leaks.</span></div>` : ''}
 <div class="secret"><code id="new-secret">${e(created.plaintext)}</code>${copyButton('new-secret', 'Copy key', 'btn btn-sm')}</div>
-<p style="margin:14px 0 8px">Then store it in the environment of the machine running your agent:</p>
-<div class="code"><pre id="new-env">export ${envVar}="${e(created.plaintext)}"</pre>${copyButton('new-env')}</div>
-<div class="next"><a class="btn btn-secondary" href="/connect">${icon('plug')}Set up a client</a></div></section>` : '';
-    const createForm = `<form class="card card-pad" method="post" action="/tokens"><input type="hidden" name="csrf" value="${csrf}">
-<h2 style="margin-bottom:12px">Create an API key</h2><div class="form-row">
-<label class="field">Name <input name="name" maxlength="80" required placeholder="e.g. Work laptop — Claude Code" autocomplete="off"></label>
-<label class="field">Expires after <select name="days">${EXPIRY.map((d) => `<option value="${d}"${d === 30 ? ' selected' : ''}>${d} days</option>`).join('')}</select></label>
-<label class="field">Access <select name="scope"><option value="${SCOPE_SUBMIT}" selected>Ingest (submit only)</option>
-<option value="${SCOPE_ADMIN}">Admin (read &amp; manage tasks)</option></select></label>
-<button class="btn" type="submit">${icon('plus')}Create key</button></div>
-<p class="small muted" style="margin:10px 0 0">Ingest keys can only submit feedback. Admin keys can also read your feedback and set its
-review state and notes through the API. No key can manage other keys.</p></form>`;
+<p style="margin:12px 0 8px">${adminCreated ? 'Store it where the admin tool runs, not where agents run:' : 'Then store it in the environment of the machine running your agent:'}</p>
+<div class="code"><pre id="new-env">export ${adminCreated ? 'HINDSIGHT_ADMIN_TOKEN' : 'HINDSIGHT_INGEST_TOKEN'}="${e(created.plaintext)}"</pre>${copyButton('new-env')}</div>
+<div class="next">${adminCreated ? `<a class="btn btn-secondary" href="/connect#admin">${icon('plug')}How to use an admin key</a>`
+    : `<a class="btn btn-secondary" href="/connect">${icon('plug')}Set up a client</a>`}</div></section>`;
+    const adminPicked = posted.scope === SCOPE_ADMIN;
+    const days = EXPIRY.includes(posted.days) ? posted.days : 30;
+    const createForm = `<form class="card card-pad kform" method="post" action="/tokens"><input type="hidden" name="csrf" value="${csrf}">
+<h2>Create an API key</h2>
+<label class="field">Name <input name="name" maxlength="80" required placeholder="e.g. Work laptop — Claude Code" autocomplete="off"${posted.name ? ` value="${e(posted.name)}"` : ''}></label>
+<fieldset class="scopes"><legend>Scope</legend><div class="scope-grid">
+<label class="scope"><input type="radio" name="scope" value="${SCOPE_SUBMIT}" id="sc-ingest"${adminPicked ? '' : ' checked'}><b>Ingest</b>
+<span>Agents submit suggestions with it. It cannot read the inbox or manage keys. Use one per machine or client.</span></label>
+<label class="scope admin"><input type="radio" name="scope" value="${SCOPE_ADMIN}" id="sc-admin"${adminPicked ? ' checked' : ''}><b>${icon('shield')}Admin</b>
+<span>Reads every item in your inbox and changes its state over the API or MCP. It can also submit. For a triage tool or script you run yourself.</span></label>
+</div></fieldset>
+<p class="admin-warn">${icon('warn')}<span><b>Admin keys are powerful.</b> Anyone holding one sees all of your inbox and can mark items done or dismissed. Do not give one to a coding agent, and prefer the shortest expiry that works.</span></p>
+<div class="row2"><label class="field">Expires after <select name="days">${EXPIRY.map((d) => `<option value="${d}"${d === days ? ' selected' : ''}>${d} days</option>`).join('')}</select></label><span></span>
+<button class="btn btn-create" type="submit">${icon('plus')}<span class="lbl-i">${adminPicked ? 'Create admin key' : 'Create key'}</span><span class="lbl-a" aria-hidden="true">Create admin key</span></button></div>
+<p class="small muted" style="margin:0">No key can create, list, or revoke keys; that stays on this page.</p></form>`;
     const listCard = list
-      ? `<section class="card" aria-label="Your API keys"><ul class="keys"><li class="hd" aria-hidden="true"><span>Name</span><span>Created</span><span>Last used</span><span>Expires / revoked</span><span></span></li>${list}</ul></section>`
+      ? `<section class="card" aria-label="Your API keys"><ul class="keys"><li class="hd" aria-hidden="true"><span>Name</span><span>Scope</span><span>Created</span><span>Last used</span><span>Expires / revoked</span><span></span></li>${list}</ul></section>`
       : emptyState('key', 'No API keys yet', 'Create a key above, then use it to connect Claude Code, Codex, Cursor, or OpenCode.');
     return shell('API keys', flash + reveal + `<div class="stack">${createForm}${listCard}</div>` +
       (pager ? `<nav class="pager" aria-label="Pages">${pager}</nav>` : ''),
-    ui(req, '/tokens', { sub: 'Keys that let your agents send feedback to this inbox, or read and manage it.' }));
+    ui(req, '/tokens', { sub: 'Ingest keys let agents send suggestions. Admin keys let a tool read and update your inbox.' }));
   };
 
   app.get('/tokens', requireReviewer, async (req, res) => {
@@ -309,7 +404,8 @@ review state and notes through the API. No key can manage other keys.</p></form>
     // A missing scope means ingest (the safe default); an unknown one is refused, never widened.
     const scope = req.body.scope === undefined ? SCOPE_SUBMIT : pick(req.body.scope, SCOPES);
     if (!name || name.length > 80 || !Number.isInteger(days) || days < 1 || days > 90 || !scope) {
-      return res.status(400).send(await tokensPage(req, { flash: alertBox('err', 'Give the key a name (up to 80 characters), an access level, and an expiry of 1–90 days.') }));
+      return res.status(400).send(await tokensPage(req, { form: { name: name.slice(0, 80), scope, days },
+        flash: alertBox('err', 'Give the key a name (up to 80 characters), a scope, and an expiry of 1–90 days.') }));
     }
     const plaintext = generateToken();
     // A key has just a name. The stored client label, which attributes and idempotency-binds its
@@ -344,16 +440,35 @@ review state and notes through the API. No key can manage other keys.</p></form>
 <div class="tl" role="presentation">${clients.map(([name], i) => `<label for="t${i + 1}">${name}</label>`).join('')}</div>
 ${clients.map(([, code, note], i) => `<div class="panel p${i + 1}">${code}<p class="muted">${note}</p></div>`).join('')}</div>`;
     const steps = `<ol class="steps">
-<li><h3>Create an API key</h3><p>One key per machine or client makes it easy to see where feedback came from, and to revoke it.</p>
+<li><h3>Create an API key</h3><p>An <b>Ingest</b> key, one per machine or client, makes it easy to see where feedback came from, and to revoke it.</p>
 <a class="btn btn-secondary btn-sm" href="/tokens">${icon('key')}Go to API keys</a></li>
 <li><h3>Store it in an environment variable</h3><p>Never paste a key into a checked-in config file.</p>${snippet('c-env', 'export HINDSIGHT_INGEST_TOKEN="hs_…"')}</li>
 <li><h3>Add HindSight to your client</h3><p>Pick your client and copy the command or config.</p>${tabs}</li>
-<li><h3>Done</h3><p>At the end of a task, agents call <code>submit_feedback</code> and the note shows up in your <a href="/review">inbox</a>.</p></li></ol>`;
+<li><h3>Done</h3><p>At the end of a task, agents call <code>submit_feedback</code> and the suggestion shows up in your <a href="/review">inbox</a>.</p></li></ol>`;
+    const api = config.publicOrigin + '/api/v1';
+    const H = '-H "Authorization: Bearer $HINDSIGHT_ADMIN_TOKEN"';
+    const adminBox = `<section class="adminbox" id="admin" aria-labelledby="adm-h"><header>${icon('shield')}<div><h2 id="adm-h">Use an admin key</h2>
+<p>For a triage script, a dashboard, or an assistant you drive yourself. Not for coding agents.</p></div></header><div class="in">
+<p class="small muted">Create a key with the <b>Admin</b> scope on <a href="/tokens">API keys</a>, then export it where that tool runs:</p>
+${snippet('a-env', 'export HINDSIGHT_ADMIN_TOKEN="hs_…"')}
+<div class="tabs" style="margin-top:14px"><input type="radio" name="adm" id="a1" checked><input type="radio" name="adm" id="a2">
+<div class="tl" role="presentation"><label for="a1">MCP (Claude Code)</label><label for="a2">HTTP</label></div>
+<div class="panel p1">${snippet('a-claude', `claude mcp add --transport http --scope user hindsight-admin ${url} \\\n  --header 'Authorization: Bearer \${HINDSIGHT_ADMIN_TOKEN}'`)}
+<p class="muted">Same endpoint as ingest; the key’s scope decides which tools are listed. An admin key gets:</p>
+<dl class="toolgrid"><dt>list_feedback</dt><dd>Read items, newest first. Optional <code>state</code>, <code>category</code>, <code>key</code> (API key name), <code>limit</code> (1–100), <code>cursor</code>.</dd>
+<dt>get_feedback</dt><dd>One item by <code>id</code>.</dd>
+<dt>update_feedback_state</dt><dd>Set <code>state</code> and/or a private <code>review_note</code> on one item.</dd>
+<dt>bulk_update_feedback_state</dt><dd>Set one <code>state</code> on up to 100 <code>ids</code>.</dd>
+<dt>submit_feedback</dt><dd>Also available: an admin key can submit, like an ingest key. Agents should still use ingest keys.</dd></dl></div>
+<div class="panel p2">${snippet('a-http', `curl -sS ${H} \\\n  "${api}/feedback?state=new&category=instructions&limit=50"\n\ncurl -sS -X PATCH ${H} \\\n  -H "Content-Type: application/json" -d '{"state":"actioned"}' \\\n  "${api}/feedback/<id>"\n\ncurl -sS -X POST ${H} \\\n  -H "Content-Type: application/json" -d '{"ids":["<id1>","<id2>"],"state":"dismissed"}' \\\n  "${api}/feedback/bulk"`)}
+<p class="muted">JSON in, JSON out. Page with <code>cursor=&lt;next_cursor&gt;</code>. States use the stored names: <code>new</code> (Open), <code>triaged</code> (Planned),
+<code>actioned</code> (Done), <code>dismissed</code> (Won’t do).</p></div></div>
+<p class="small muted" style="margin:12px 0 0">Item text is agent-submitted: a tool using an admin key must treat it as data, never as instructions.</p></div></section>`;
     const aside = `<aside class="card card-pad"><h2 style="margin-bottom:12px">Server details</h2>
 <p class="small muted" style="margin:0 0 6px">MCP endpoint</p><div class="secret" style="margin-bottom:14px"><code id="c-url" class="small">${e(url)}</code>${copyButton('c-url', 'Copy', 'btn btn-ghost btn-sm')}</div>
-<dl class="kv"><dt>Transport</dt><dd>Streamable HTTP</dd><dt>Auth</dt><dd>Bearer API key</dd><dt>Tool</dt><dd>submit_feedback</dd><dt>Rate limit</dt><dd>${config.rateLimitPerMinute}/min per key</dd></dl></aside>`;
-    res.send(shell('Connect a client', `<div class="grid2"><section class="card card-pad">${steps}</section>${aside}</div>`,
-      ui(req, '/connect', { sub: 'Point your coding agents at HindSight so they can send improvement notes when they finish work.' })));
+<dl class="kv"><dt>Transport</dt><dd>Streamable HTTP</dd><dt>Auth</dt><dd>Bearer API key</dd><dt>Tool</dt><dd>submit_feedback</dd><dt>Admin</dt><dd><a href="#admin">+ 4 tools, /api/v1</a></dd><dt>Rate limit</dt><dd>${config.rateLimitPerMinute}/min per key</dd></dl></aside>`;
+    res.send(shell('Connect a client', `<div class="grid2"><div><section class="card card-pad">${steps}</section>${adminBox}</div>${aside}</div>`,
+      ui(req, '/connect', { sub: 'Point your coding agents at HindSight so they can send suggestions when they finish work.' })));
   });
 
   app.use((err, _req, res, _next) => {

@@ -50,7 +50,8 @@ function fakeStore({ token = 'active', fail = false, limited = false, hasMore = 
   const admin = adminMemory(rows);
   s.adminRows = admin.adminRows;
   s.adminCalls = [];
-  for (const k of ['listFeedbackPage', 'getFeedback', 'updateFeedback', 'bulkSetReviewState']) {
+  s.memory = admin;
+  for (const k of ['listFeedbackPage', 'getFeedback', 'updateFeedback', 'bulkSetReviewState', 'countFeedback']) {
     s[k] = rec(k, (...args) => { s.adminCalls.push([k, ...args]); return admin[k](...args); });
   }
   return s;
@@ -187,11 +188,18 @@ test('review filters are allow-listed and scoped to the signed-in reviewer', asy
     assert.equal((await call(base, '/review?category=connector&state=triaged&client=c&page=2')).status, 200);
     assert.equal((await call(base, '/review?category=bogus&state=deleted&page=-5')).status, 200);
     assert.equal((await call(base, '/review?page=9999')).status, 200);
+    // Checklist views map onto DB states; legacy single-state links still work.
+    for (const state of ['open', 'done', 'wontdo', 'all', 'new', 'actioned', 'dismissed']) {
+      assert.equal((await call(base, '/review?state=' + state)).status, 200, state);
+    }
   });
+  const open = ['new', 'triaged'];
   assert.deepEqual(store.lists, [
-    [OWNER, { category: 'connector', state: 'triaged', client: 'c', page: 2 }],
-    [OWNER, { category: undefined, state: undefined, client: undefined, page: 0 }],
-    [OWNER, { category: undefined, state: undefined, client: undefined, page: 40 }],
+    [OWNER, { category: 'connector', states: ['triaged'], client: 'c', page: 2 }],
+    [OWNER, { category: undefined, states: open, client: undefined, page: 0 }],
+    [OWNER, { category: undefined, states: open, client: undefined, page: 40 }],
+    ...[open, ['actioned'], ['dismissed'], undefined, ['new'], ['actioned'], ['dismissed']]
+      .map((states) => [OWNER, { category: undefined, states, client: undefined, page: 0 }]),
   ]);
 });
 
@@ -272,6 +280,7 @@ test('ingestion token is ingestion-only: no review or token-management access', 
     assert.equal((await post(base, '/tokens', { name: 'n', client: 'c', days: '7', csrf }, bearer)).status, 303);
     assert.equal((await post(base, `/tokens/${ID}/revoke`, { csrf }, bearer)).status, 303);
     assert.equal((await post(base, `/review/${ID}/state`, { state: 'triaged', csrf }, bearer)).status, 303);
+    assert.equal((await post(base, '/review/bulk', { ids: ID, state: 'actioned', csrf }, bearer)).status, 303);
   });
   assert.deepEqual(store.calls, []);
 });
@@ -368,19 +377,19 @@ test('long unbroken metadata and key names wrap inside their containers', async 
     const tokens = text(await call(base, '/tokens'));
     // Complete values stay rendered (no truncation) in the wrapped containers.
     for (const v of [`<dt>Repository</dt><dd>${repository}</dd>`, `<dt>Task</dt><dd>${task}</dd>`,
-      `<dt>Source</dt><dd>${source}</dd>`, `</svg>${client}</span>`]) {
+      `<dt>Source</dt><dd>${source}</dd>`, `<span class="src">${client}</span>`]) {
       assert.ok(review.includes(v), v.slice(0, 20));
     }
     assert.ok(tokens.includes(`<b>${name}</b>`));
     for (const css of [styleOf(review), styleOf(tokens)]) {
-      for (const selector of ['.ctx dd', '.keys .name b', '.fb-top .src']) {
+      for (const selector of ['.facts dd', '.keys .name b', '.meta .src']) {
         const decl = rule(css, selector);
         assert.match(decl, /(?:^|;)min-width:0(?:;|$)/, selector);
         assert.match(decl, /(?:^|;)overflow-wrap:anywhere(?:;|$)/, selector);
         assert.doesNotMatch(decl, /overflow:hidden|text-overflow|white-space:nowrap/, selector);
       }
-      assert.match(rule(css, '.ctx'), /flex-wrap:wrap/);
-      assert.match(rule(css, '.fb-top'), /flex-wrap:wrap/);
+      assert.match(rule(css, '.facts'), /flex-wrap:wrap/);
+      assert.match(rule(css, '.meta'), /flex-wrap:wrap/);
     }
   });
 });
@@ -465,8 +474,8 @@ test('review state change returns to the same filtered view, and only to /review
   const csrf = csrfToken(SECRET, OWNER);
   await serve(app(fakeStore()), async (base) => {
     const html = text(await call(base, '/review?state=new&category=skills'));
-    assert.ok(html.includes('name="next" value="/review?category=skills&amp;state=new"'));
-    assert.ok(html.includes('<button name="state" value="new" aria-pressed="true">'));
+    assert.ok(html.includes('name="next" value="/review?state=new&amp;category=skills"'));
+    assert.ok(html.includes('aria-checked="false" aria-label="Mark done"'));
     const back = await post(base, `/review/${ID}/state`, { state: 'triaged', csrf, next: '/review?category=skills&state=new' });
     assert.equal(back.headers.location, `/review?category=skills&state=new#fb-${ID}`);
     for (const next of ['https://evil.test/review', '//evil.test', '/tokens', '/review/../tokens', '/review?x=<b>']) {
@@ -708,19 +717,22 @@ test('API keys page: choose ingest or admin scope; scope is stored, listed, and 
   ] } });
   await serve(app(store), async (base) => {
     const page = text(await call(base, '/tokens'));
-    assert.ok(page.includes('<select name="scope"><option value="feedback:submit" selected>Ingest (submit only)</option>'));
-    assert.ok(page.includes('<option value="feedback:admin">Admin (read &amp; manage tasks)</option>'));
-    assert.match(page, /<b>ops<\/b>\n<span class="pill cat" title="Scope feedback:admin">Admin<\/span>/);
-    assert.match(page, /<b>laptop<\/b>\n<span class="pill" title="Scope feedback:submit">Ingest<\/span>/);
+    assert.ok(page.includes('<input type="radio" name="scope" value="feedback:submit" id="sc-ingest" checked>'));
+    assert.ok(page.includes('<input type="radio" name="scope" value="feedback:admin" id="sc-admin">'));
+    assert.match(page, /<li class="is-admin"><div class="name"><span class="keyico admin">[\s\S]*?<b>ops<\/b>[\s\S]*?<span class="scopelbl admin" title="Scope feedback:admin">/);
+    assert.match(page, /<li><div class="name"><span class="keyico">[\s\S]*?<b>laptop<\/b>[\s\S]*?<span class="scopelbl" title="Scope feedback:submit">Ingest<\/span>/);
 
     const created = text(await post(base, '/tokens', { name: 'Ops bot', days: '7', scope: ADMIN, csrf }));
     const secret = created.match(/<code id="new-secret">(hs_[A-Za-z0-9_-]{43})<\/code>/)[1];
-    assert.ok(created.includes('Admin API key “Ops bot” created'));
+    assert.ok(created.includes('Admin key “Ops bot” created'));
+    assert.ok(created.includes('<section class="reveal admin"'));
+    assert.ok(created.includes('href="/connect#admin"'));
     assert.ok(created.includes('Scope <code>feedback:admin</code>'));
     assert.ok(created.includes(`export HINDSIGHT_ADMIN_TOKEN="${secret}"`));
     assert.ok(!created.includes('HINDSIGHT_INGEST_TOKEN="'));
     const ingest = text(await post(base, '/tokens', { name: 'Laptop', days: '7', scope: 'feedback:submit', csrf }));
-    assert.ok(ingest.includes('Ingest API key “Laptop” created'));
+    assert.ok(ingest.includes('Ingest key “Laptop” created'));
+    assert.ok(ingest.includes('<section class="reveal"'));
     assert.ok(ingest.includes('Scope <code>feedback:submit</code>'));
     assert.match(ingest, /export HINDSIGHT_INGEST_TOKEN="hs_/);
     await post(base, '/tokens', { name: 'Default', days: '7', csrf }); // no scope field: ingest
@@ -739,16 +751,17 @@ test('review note: CSRF-protected, owner-scoped, bounded, cleared when empty, re
   store.listFeedback = async () => ({ hasMore: false, rows: [{ ...store.adminRows[0], review_note: '<b>note</b>' }] });
   await serve(app(store), async (base) => {
     const html = text(await call(base, '/review?state=new'));
-    assert.ok(html.includes(`<form method="post" action="/review/${fid(1)}/note">`));
+    assert.ok(html.includes(`action="/review/${fid(1)}/note"`));
     assert.ok(html.includes('&lt;b&gt;note&lt;/b&gt;</textarea>'));
     assert.ok(!html.includes('<b>note</b>'));
-    assert.match(html, /<details style="width:100%" open>/);
+    assert.match(html, /<form class="note" id="nt-[^"]+" method="post" action="\/review\/[^"]+\/note">/);
+    assert.ok(html.includes('<span class="tag hasnote">Has note</span>'));
     const path = `/review/${fid(1)}/note`;
     assert.equal((await post(base, path, { note: 'x', csrf: 'wrong' })).status, 403);
     assert.equal((await post(base, path, { note: 'x', csrf }, { origin: 'https://evil.test' })).status, 403);
     const ok = await post(base, path, { note: '  Follow up Friday  ', csrf, next: '/review?state=new' });
     assert.equal(ok.status, 303);
-    assert.equal(ok.headers.location, `/review?state=new#fb-${fid(1)}`);
+    assert.equal(ok.headers.location, `/review?state=new#nt-${fid(1)}`);
     assert.equal(store.adminRows[0].review_note, 'Follow up Friday');
     assert.equal(store.adminRows[0].review_state, 'new'); // a note alone does not change state
     assert.equal((await post(base, path, { note: 'é'.repeat(2000), csrf })).status, 303); // ~18 KB encoded
@@ -762,5 +775,182 @@ test('review note: CSRF-protected, owner-scoped, bounded, cleared when empty, re
   assert.equal(store.adminRows.find((r) => r.id === fid(101)).review_note, null);
   await serve(app(store, { getReviewer: anonymous }), async (base) => {
     assert.equal((await post(base, `/review/${fid(1)}/note`, { note: 'x', csrf }, bearer)).status, 303); // to sign-in
+  });
+});
+
+// ---- Inbox checklist: views, counts, toggles, bulk select.
+const OTHER = 'other@example.com';
+const DAY = 864e5;
+// Rows for OWNER in every state, plus another owner's rows that must never show up or change.
+function checklistStore() {
+  const mine = seedRows(OWNER, 6, 1, (i) => ({ review_state: ['new', 'triaged', 'actioned', 'dismissed', 'new', 'new'][i],
+    category: i < 3 ? 'skills' : 'codebase', client: i % 2 ? 'Codex' : 'laptop', improvement: `improve ${i + 1}`,
+    created_at: new Date(Date.now() - [0, 1, 1.2, 3, 4, 10][i] * DAY - 60000) }));
+  const store = fakeStore({ rows: [...mine, ...seedRows(OTHER, 3, 101, () => ({ client: 'laptop' }))] });
+  store.listFeedback = store.memory.listFeedback;
+  store.setReviewState = store.memory.setReviewState;
+  return store;
+}
+const stateOf = (store, n) => store.adminRows.find((r) => r.id === fid(n)).review_state;
+const views = (html) => [...html.matchAll(/<a href="([^"]*)"( aria-current="page")?>([^<]+) <span class="n">(\d+)<\/span><\/a>/g)]
+  .map((m) => [m[3], Number(m[4]), Boolean(m[2]), m[1].replaceAll('&amp;', '&')]);
+
+test('inbox: checklist rows, view tabs with owner-scoped counts, and the default Open view', async () => {
+  const store = checklistStore();
+  await serve(app(store), async (base) => {
+    const html = text(await call(base, '/review'));
+    assert.deepEqual(views(html), [['Open', 4, true, '/review'], ['Done', 1, false, '/review?state=done'],
+      ['Won’t do', 1, false, '/review?state=wontdo'], ['All', 6, false, '/review?state=all']]);
+    assert.deepEqual([...html.matchAll(/<span class="title">([^<]+)</g)].map((m) => m[1]), ['improve 1', 'improve 2', 'improve 5', 'improve 6']);
+    // Open: an empty box that posts actioned; Planned: a dot, still unchecked, still ticks to Done.
+    assert.ok(html.includes(`<li class="task is-open" id="fb-${fid(1)}"><form class="chk-form" method="post" action="/review/${fid(1)}/state">`));
+    assert.ok(html.includes('<button class="chk" type="submit" name="state" value="actioned" role="checkbox" aria-checked="false" aria-label="Mark done">'));
+    assert.ok(html.includes('<button class="chk planned" type="submit" name="state" value="actioned" role="checkbox" aria-checked="false" aria-label="Mark done (currently planned)">'));
+    assert.ok(html.includes('<span class="tag planned">Planned</span>'));
+    // The improvement is the title; friction, facts, request id, note form, and actions sit in a native <details>.
+    assert.match(html, /<details class="body"><summary><span class="title">improve 1<\/span>[\s\S]*?<div class="detail"><h3>Friction<\/h3><p class="prose">friction 1<\/p>/);
+    assert.match(html, /<code id="rq-[^"]+">req-seed-1<\/code>[\s\S]*?<form class="actions"[\s\S]*?value="triaged">[\s\S]*?Plan<\/button>[\s\S]*?value="dismissed">[\s\S]*?Won’t do<\/button>[\s\S]*?value="actioned">[\s\S]*?Mark done<\/button>/);
+    assert.ok(html.includes('<details class="menu"><summary aria-label="More actions">'));
+    assert.ok(html.includes('href="/review?client=laptop">'));
+    assert.ok(!html.includes('friction 101'));
+    // Date groups: Today / Yesterday / Earlier, each a real heading.
+    assert.deepEqual([...html.matchAll(/<h2 class="group">(\w+) <span class="n">(\d+)<\/span><\/h2>/g)].map((m) => m[1] + m[2]),
+      ['Today1', 'Yesterday1', 'Earlier2']);
+
+    const done = text(await call(base, '/review?state=done'));
+    assert.ok(done.includes('<button class="chk" type="submit" name="state" value="new" role="checkbox" aria-checked="true" aria-label="Reopen">'));
+    assert.ok(done.includes('<li class="task is-done"'));
+    const wontdo = text(await call(base, '/review?state=wontdo'));
+    assert.ok(wontdo.includes('<button class="chk wontdo" type="submit" name="state" value="new" role="checkbox" aria-checked="false" aria-label="Reopen (currently won’t do)">'));
+    // Counts honour the category and key filters; the tabs keep them.
+    const filtered = text(await call(base, '/review?state=all&category=codebase&client=Codex'));
+    assert.deepEqual(views(filtered).map(([l, n, cur]) => [l, n, cur]), [['Open', 1, false], ['Done', 0, false], ['Won’t do', 1, false], ['All', 2, true]]);
+    assert.equal(views(filtered)[0][3], '/review?category=codebase&client=Codex');
+    // Legacy ?state=triaged narrows the Open view and says so.
+    const planned = text(await call(base, '/review?state=triaged'));
+    assert.deepEqual([...planned.matchAll(/<span class="title">([^<]+)</g)].map((m) => m[1]), ['improve 2']);
+    assert.match(planned, /Showing only Planned items/);
+    assert.equal(views(planned)[0][2], true);
+    // Grouping by category, or none.
+    const byCat = text(await call(base, '/review?state=all&group=category'));
+    assert.deepEqual([...byCat.matchAll(/<h2 class="group">(\w+) /g)].map((m) => m[1]), ['skills', 'codebase']);
+    assert.ok(!text(await call(base, '/review?state=all&group=none')).includes('<h2 class="group">'));
+  });
+  assert.ok(store.calls.includes('countFeedback'));
+  assert.ok(store.adminCalls.filter(([k]) => k === 'countFeedback').every(([, owner]) => owner === OWNER));
+});
+
+test('inbox: ticking marks done, unticking a done or won’t-do item reopens it, owner-scoped', async () => {
+  const csrf = csrfToken(SECRET, OWNER);
+  const store = checklistStore();
+  await serve(app(store), async (base) => {
+    const tick = await post(base, `/review/${fid(1)}/state`, { state: 'actioned', csrf, next: '/review?state=all' });
+    assert.equal(tick.status, 303);
+    assert.equal(tick.headers.location, `/review?state=all#fb-${fid(1)}`);
+    assert.equal(stateOf(store, 1), 'actioned');
+    assert.ok(store.adminRows.find((r) => r.id === fid(1)).actioned_at instanceof Date);
+    assert.ok(text(await call(base, '/review?state=done')).includes(`id="fb-${fid(1)}"`));
+    assert.equal((await post(base, `/review/${fid(2)}/state`, { state: 'actioned', csrf })).status, 303); // planned -> done
+    assert.equal(stateOf(store, 2), 'actioned');
+    for (const n of [1, 4]) { // done -> open, won't do -> open
+      assert.equal((await post(base, `/review/${fid(n)}/state`, { state: 'new', csrf })).status, 303);
+      assert.equal(stateOf(store, n), 'new');
+    }
+    assert.equal((await post(base, `/review/${fid(101)}/state`, { state: 'actioned', csrf })).status, 404);
+    assert.equal((await post(base, `/review/${fid(1)}/state`, { state: 'done', csrf })).status, 400);
+    assert.equal((await post(base, `/review/${fid(1)}/state`, { state: 'actioned', csrf: 'wrong' })).status, 403);
+  });
+  assert.equal(stateOf(store, 101), 'new');
+});
+
+test('inbox: empty states for a new inbox, an all-clear Open view, and filters', async () => {
+  const none = fakeStore();
+  none.listFeedback = none.memory.listFeedback;
+  await serve(app(none), async (base) => {
+    assert.match(text(await call(base, '/review')), /No feedback yet[\s\S]*href="\/connect"/);
+  });
+  const allDone = fakeStore({ rows: seedRows(OWNER, 2, 1, () => ({ review_state: 'actioned' })) });
+  allDone.listFeedback = allDone.memory.listFeedback;
+  await serve(app(allDone), async (base) => {
+    assert.match(text(await call(base, '/review')), /All clear[\s\S]*href="\/review\?state=done">See what’s done/);
+    assert.match(text(await call(base, '/review?category=connector')), /Nothing matches these filters[\s\S]*href="\/review">Clear filters/);
+    assert.match(text(await call(base, '/review?state=wontdo')), /Nothing here/);
+  });
+});
+
+test('inbox bulk select: one CSRF form, owner-scoped, capped at 100 ids, valid states only', async () => {
+  const csrf = csrfToken(SECRET, OWNER);
+  const store = checklistStore();
+  const bulk = (fields, headers) => {
+    const body = new URLSearchParams();
+    for (const [k, v] of Object.entries(fields)) for (const x of [v].flat()) body.append(k, x);
+    return call(base0, '/review/bulk', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', origin: ORIGIN, ...headers }, body: body.toString() });
+  };
+  let base0;
+  await serve(app(store), async (base) => {
+    base0 = base;
+    const html = text(await call(base, '/review?select=1'));
+    assert.ok(html.includes('<form id="bulk" class="bulkbar" method="post" action="/review/bulk" role="group" aria-label="Bulk actions">'));
+    assert.ok(html.includes('<input type="hidden" name="next" value="/review">'));
+    assert.match(html, new RegExp(`<input type="checkbox" name="ids" value="${fid(1)}" form="bulk" aria-label="Select: improve 1">`));
+    assert.ok(!html.includes('class="chk-form"') && !html.includes('<details class="menu">'));
+    for (const v of ['actioned', 'triaged', 'dismissed']) assert.ok(html.includes(`name="state" value="${v}">`), v);
+    assert.ok(text(await call(base, '/review')).includes('href="/review?select=1">'));
+
+    const ids = [fid(1), fid(2), fid(101)];
+    assert.equal((await bulk({ ids, state: 'actioned', csrf: 'wrong' })).status, 403);
+    assert.equal((await bulk({ ids, state: 'actioned', csrf }, { origin: 'https://evil.test' })).status, 403);
+    assert.equal((await bulk({ ids, state: 'done', csrf })).status, 400);
+    assert.equal((await bulk({ ids, csrf })).status, 400);
+    assert.equal((await bulk({ ids: [fid(1), 'not-a-uuid'], state: 'actioned', csrf })).status, 400);
+    assert.equal((await bulk({ state: 'actioned', csrf })).status, 400);
+    assert.equal((await bulk({ ids: Array.from({ length: 101 }, (_, i) => fid(i + 200)), state: 'actioned', csrf })).status, 400);
+    assert.deepEqual([1, 2, 101].map((n) => stateOf(store, n)), ['new', 'triaged', 'new']);
+    assert.ok(!store.calls.includes('bulkSetReviewState'));
+
+    const ok = await bulk({ ids, state: 'dismissed', csrf, next: '/review?state=all&category=skills' });
+    assert.equal(ok.status, 303);
+    assert.equal(ok.headers.location, '/review?state=all&category=skills');
+    assert.equal((await bulk({ ids: fid(3), state: 'new', csrf, next: '//evil.test' })).headers.location, '/review');
+    const cap = await bulk({ ids: Array.from({ length: 100 }, (_, i) => fid(i + 200)), state: 'triaged', csrf });
+    assert.equal(cap.status, 303); // exactly 100 is allowed; unknown ids are simply not updated
+  });
+  assert.deepEqual([1, 2, 3, 101].map((n) => stateOf(store, n)), ['dismissed', 'dismissed', 'new', 'new']);
+  assert.ok(store.adminCalls.filter(([k]) => k === 'bulkSetReviewState').every(([, owner]) => owner === OWNER));
+});
+
+test('API keys scope chooser: two radio cards, Ingest by default, admin warning and posted scope kept on error', async () => {
+  const csrf = csrfToken(SECRET, OWNER);
+  await serve(app(fakeStore()), async (base) => {
+    const page = text(await call(base, '/tokens'));
+    assert.match(page, /<fieldset class="scopes"><legend>Scope<\/legend>/);
+    assert.ok(page.includes('<label class="scope"><input type="radio" name="scope" value="feedback:submit" id="sc-ingest" checked><b>Ingest</b>'));
+    assert.ok(page.includes('<label class="scope admin"><input type="radio" name="scope" value="feedback:admin" id="sc-admin">'));
+    // The warning is always in the DOM; CSS :has hides it while Ingest is picked (no :has -> always visible).
+    assert.ok(page.includes('<p class="admin-warn">'));
+    assert.ok(page.includes('.kform:has(#sc-ingest:checked) .admin-warn{display:none}'));
+    assert.ok(page.includes('<span class="lbl-i">Create key</span>'));
+    const bad = await post(base, '/tokens', { name: '', days: '90', scope: 'feedback:admin', csrf });
+    assert.equal(bad.status, 400);
+    assert.ok(text(bad).includes('id="sc-admin" checked>'));
+    assert.ok(text(bad).includes('<option value="90" selected>'));
+    assert.ok(text(bad).includes('<span class="lbl-i">Create admin key</span>'));
+  });
+});
+
+test('connect screen explains admin keys with the real MCP tools and REST endpoints', async () => {
+  await serve(app(fakeStore()), async (base) => {
+    const html = text(await call(base, '/connect'));
+    assert.ok(html.includes('<section class="adminbox" id="admin"'));
+    for (const tool of ['list_feedback', 'get_feedback', 'update_feedback_state', 'bulk_update_feedback_state']) {
+      assert.ok(html.includes(`<dt>${tool}</dt>`), tool);
+    }
+    assert.match(html, /<dt>submit_feedback<\/dt><dd>Also available/);
+    assert.ok(html.includes('export HINDSIGHT_ADMIN_TOKEN=&quot;hs_…&quot;'));
+    assert.ok(html.includes(`${ORIGIN}/api/v1/feedback?state=new`));
+    assert.ok(html.includes(`${ORIGIN}/api/v1/feedback/bulk`));
+    assert.ok(html.includes('Authorization: Bearer ${HINDSIGHT_ADMIN_TOKEN}'));
+    for (const id of ['a-env', 'a-claude', 'a-http']) assert.ok(html.includes(`data-copy="${id}"`), id);
+    assert.doesNotMatch(html, /list_tasks|update_task|\/api\/tasks/);
   });
 });
