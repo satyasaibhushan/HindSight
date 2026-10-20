@@ -6,16 +6,17 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { after, before, describe, test } from 'node:test';
 import { assertScoped, loadMigrations, planMigrations, runMigrations } from '../scripts/migrate.js';
-import { createPgStore, PG_POOL_OPTIONS, TOKEN_PAGE_SIZE } from '../src/db.js';
+import { createPgStore, MAX_BULK, PG_POOL_OPTIONS, TOKEN_PAGE_SIZE } from '../src/db.js';
+import { SCOPES } from '../src/admin.js';
 import { CATEGORIES, payloadHash } from '../src/mcp.js';
 import { generateToken, hashToken } from '../src/security.js';
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { call, env, serve } from './helpers.js';
 
-// The four authored migration files; every ledger assertion below derives from this list.
+// The five authored migration files; every ledger assertion below derives from this list.
 const EXPECTED = [['001', 'hindsight'], ['002', 'idempotency_review'], ['003', 'bounded_rate_limits'],
-  ['004', 'feedback_categories']];
+  ['004', 'feedback_categories'], ['005', 'admin_scope']];
 const VERSIONS = EXPECTED.map(([v]) => v);
 const NEW_CATEGORIES = ['instructions', 'skills', 'codebase', 'collaboration'];
 
@@ -57,6 +58,13 @@ test('004 category constraint matches CATEGORIES and keeps every old value', () 
   assert.deepEqual(allowed, CATEGORIES);
   for (const c of [...NEW_CATEGORIES, 'connector', 'tooling', 'environment', 'documentation', 'workflow',
     'performance', 'other']) assert.ok(allowed.includes(c), c);
+});
+
+test('005 scope constraint matches SCOPES and keeps feedback:submit', () => {
+  const sql = loadMigrations().find((m) => m.version === '005').sql;
+  const allowed = [...sql.match(/CHECK \(scope IN \(([^)]*)\)\)/)[1].matchAll(/'([a-z:]+)'/g)].map((x) => x[1]);
+  assert.deepEqual(allowed, SCOPES);
+  assert.deepEqual(SCOPES, ['feedback:submit', 'feedback:admin']);
 });
 
 const target = resolveTestDatabase();
@@ -151,19 +159,19 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       const schema = await migrated();
       const c = await schemaClient(schema);
       const base = loadMigrations();
-      // Fixture version is the next one after the real files, so it never collides with an authored migration.
-      const next = String(Number(base.at(-1).version) + 1).padStart(3, '0');
-      assert.equal(next, '005');
+      // Fixture version is far beyond the authored files, so it never collides with a real migration.
+      const next = '900';
+      assert.ok(base.every((m) => m.version < next));
       const bad = { version: next, name: 'bad', checksum: 'a'.repeat(64),
         sql: 'CREATE TABLE hindsight_probe (id int); SELECT 1/0;' };
       const good = { ...bad, checksum: 'b'.repeat(64), sql: 'CREATE TABLE hindsight_probe (id int);' };
       try {
-        await assert.rejects(runMigrations(c, { migrations: [...base, bad] }), /005_bad failed and was rolled back/);
+        await assert.rejects(runMigrations(c, { migrations: [...base, bad] }), /900_bad failed and was rolled back/);
         const { rows } = await c.query(`SELECT to_regclass('hindsight_probe') AS t,
           (SELECT count(*)::int FROM hindsight_schema_migrations) AS n`);
         assert.deepEqual(rows[0], { t: null, n: VERSIONS.length });
         assert.deepEqual(await runMigrations(c, { migrations: [...base, good] }),
-          { applied: ['005'], skipped: VERSIONS });
+          { applied: ['900'], skipped: VERSIONS });
       } finally { await c.end(); }
     });
 
@@ -177,12 +185,38 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
           RETURNING id`, [hashToken(generateToken())]);
         await c.query(`INSERT INTO hindsight_rate_limits (token_id, window_start, count) VALUES
           ($1, '2026-01-01T00:00Z', 5), ($1, '2026-01-01T00:01Z', 2), ($1, '2026-01-01T00:02Z', 7)`, [tok.id]);
-        assert.deepEqual((await runMigrations(c, { migrations: files })).applied, ['003', '004']);
+        assert.deepEqual((await runMigrations(c, { migrations: files })).applied, VERSIONS.slice(2));
         const { rows } = await c.query('SELECT window_start, count FROM hindsight_rate_limits');
         assert.equal(rows.length, 1);
         assert.equal(rows[0].window_start.toISOString(), '2026-01-01T00:02:00.000Z');
         assert.equal(rows[0].count, 7);
         await assert.rejects(c.query(`INSERT INTO hindsight_rate_limits VALUES ($1, now(), 1)`, [tok.id]), /duplicate key/);
+      } finally { await c.end(); }
+    });
+
+    test('005 keeps existing tokens and feedback valid, adds admin scope and review columns', async () => {
+      const files = loadMigrations();
+      const schema = await migrated({ migrations: files.filter((m) => m.version < '005') });
+      const c = await schemaClient(schema);
+      try {
+        const plaintext = generateToken();
+        const { rows: [tok] } = await c.query(`INSERT INTO hindsight_ingestion_tokens
+          (owner_email, name, client, token_hash, expires_at) VALUES ('o@example.com','n','c',$1, now() + interval '1 day')
+          RETURNING id`, [hashToken(plaintext)]);
+        await c.query(`INSERT INTO hindsight_feedback (token_id, owner_email, client, request_id, payload_hash, friction,
+          improvement, category, review_state, reviewed_at) VALUES ($1,'o@example.com','c','pre-005-0001',$2,'f','i','skills','actioned',now())`,
+        [tok.id, '0'.repeat(64)]);
+        await assert.rejects(c.query(`UPDATE hindsight_ingestion_tokens SET scope = 'feedback:admin'`), /check constraint/);
+        assert.deepEqual((await runMigrations(c, { migrations: files })).applied, ['005']);
+        const { rows: [t] } = await c.query('SELECT scope FROM hindsight_ingestion_tokens WHERE id = $1', [tok.id]);
+        assert.equal(t.scope, 'feedback:submit');
+        const { rows: [f] } = await c.query('SELECT review_state, review_note, actioned_at, dismissed_at FROM hindsight_feedback');
+        assert.deepEqual(f, { review_state: 'actioned', review_note: null, actioned_at: null, dismissed_at: null });
+        await c.query(`UPDATE hindsight_ingestion_tokens SET scope = 'feedback:admin'`);
+        await assert.rejects(c.query(`UPDATE hindsight_ingestion_tokens SET scope = 'feedback:all'`), /check constraint/);
+        await assert.rejects(c.query(`UPDATE hindsight_feedback SET review_note = ''`), /check constraint/);
+        await assert.rejects(c.query(`UPDATE hindsight_feedback SET review_note = repeat('x', 2001)`), /check constraint/);
+        await c.query(`UPDATE hindsight_feedback SET review_note = repeat('é', 2000)`);
       } finally { await c.end(); }
     });
   });
@@ -196,9 +230,9 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
     });
 
     const day = () => new Date(Date.now() + 86400000);
-    async function token(s, ownerEmail, client = 'claude-code') {
+    async function token(s, ownerEmail, client = 'claude-code', scope) {
       const plaintext = generateToken();
-      const id = await s.createToken({ ownerEmail, name: 'test', client, tokenHash: hashToken(plaintext), expiresAt: day() });
+      const id = await s.createToken({ ownerEmail, name: 'test', client, tokenHash: hashToken(plaintext), expiresAt: day(), scope });
       return { id, plaintext, auth: await s.authenticateIngestionToken(hashToken(plaintext)) };
     }
     const feedback = (requestId, extra = {}) => ({
