@@ -178,7 +178,8 @@ test('unauthenticated review redirects; feedback is escaped with private headers
     assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
     assert.ok(!html.includes('<img src=x>'));
     assert.ok(html.includes('c&lt;b&gt;'));
-    assert.match(html, /Older/);
+    assert.ok(html.includes('<a class="btn btn-secondary btn-sm" href="/review?shown=50#more-25" data-more>Show more</a>'));
+    assert.doesNotMatch(html, /Newer|Older/);
   });
 });
 
@@ -193,13 +194,14 @@ test('review filters are allow-listed and scoped to the signed-in reviewer', asy
       assert.equal((await call(base, '/review?state=' + state)).status, 200, state);
     }
   });
+  // Old ?page=<p> links map to the cumulative list that reaches the end of that page, capped at 1025 items.
   const open = ['new', 'triaged'];
   assert.deepEqual(store.lists, [
-    [OWNER, { category: 'connector', states: ['triaged'], client: 'c', page: 2 }],
-    [OWNER, { category: undefined, states: open, client: undefined, page: 0 }],
-    [OWNER, { category: undefined, states: open, client: undefined, page: 40 }],
+    [OWNER, { category: 'connector', states: ['triaged'], client: 'c', limit: 75 }],
+    [OWNER, { category: undefined, states: open, client: undefined, limit: 25 }],
+    [OWNER, { category: undefined, states: open, client: undefined, limit: 1025 }],
     ...[open, ['actioned'], ['dismissed'], undefined, ['new'], ['actioned'], ['dismissed']]
-      .map((states) => [OWNER, { category: undefined, states, client: undefined, page: 0 }]),
+      .map((states) => [OWNER, { category: undefined, states, client: undefined, limit: 25 }]),
   ]);
 });
 
@@ -320,7 +322,7 @@ test('token whose owner was removed from reviewers is rejected before throttle o
 
 test('only the sign-in page may submit forms to the exact Google authorization origin', async () => {
   const policy = (formAction) =>
-    `default-src 'none'; script-src ${SCRIPT_HASH}; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
+    `default-src 'none'; script-src ${SCRIPT_HASH}; style-src 'unsafe-inline'; connect-src 'self'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
   await serve(app(fakeStore()), async (base) => {
     for (const path of ['/auth/signin', '/auth/signin?callbackUrl=%2Freview']) {
       assert.equal((await call(base, path)).headers['content-security-policy'], policy("'self' https://accounts.google.com"));
@@ -891,11 +893,12 @@ test('inbox bulk select: one CSRF form, owner-scoped, capped at 100 ids, valid s
     base0 = base;
     const html = text(await call(base, '/review?select=1'));
     assert.ok(html.includes('<form id="bulk" class="bulkbar" method="post" action="/review/bulk" role="group" aria-label="Bulk actions">'));
-    assert.ok(html.includes('<input type="hidden" name="next" value="/review">'));
+    // Bulk changes return to select mode, with the same view and list length.
+    assert.ok(html.includes('<form id="bulk" class="bulkbar" method="post" action="/review/bulk" role="group" aria-label="Bulk actions">\n<input type="hidden" name="csrf" value="' + csrf + '"><input type="hidden" name="next" value="/review?select=1">'));
     assert.match(html, new RegExp(`<input type="checkbox" name="ids" value="${fid(1)}" form="bulk" aria-label="Select: improve 1">`));
     assert.ok(!html.includes('class="chk-form"') && !html.includes('<details class="menu">'));
     for (const v of ['actioned', 'triaged', 'dismissed']) assert.ok(html.includes(`name="state" value="${v}">`), v);
-    assert.ok(text(await call(base, '/review')).includes('href="/review?select=1">'));
+    assert.ok(text(await call(base, '/review')).includes('href="/review?select=1" data-here>'));
 
     const ids = [fid(1), fid(2), fid(101)];
     assert.equal((await bulk({ ids, state: 'actioned', csrf: 'wrong' })).status, 403);
@@ -953,4 +956,144 @@ test('connect screen explains admin keys with the real MCP tools and REST endpoi
     for (const id of ['a-env', 'a-claude', 'a-http']) assert.ok(html.includes(`data-copy="${id}"`), id);
     assert.doesNotMatch(html, /list_tasks|update_task|\/api\/tasks/);
   });
+});
+
+// ---- Inbox "Show more": one cumulative list (?shown=n), a batch fragment for the script, and the cap.
+const titles = (html) => [...html.matchAll(/<span class="title">([^<]+)</g)].map((m) => m[1]);
+const groupsOf = (html) => [...html.matchAll(/<h2 class="group">(\w+) <span class="n">(\d+)<\/span><\/h2>/g)].map((m) => m[1] + m[2]);
+function longStore(count) {
+  const store = fakeStore({ rows: [...seedRows(OWNER, count, 1, (i) => ({ improvement: `item ${i + 1}`, category: i % 2 ? 'codebase' : 'skills' })),
+    ...seedRows(OTHER, 30, 5001)] });
+  const list = store.memory.listFeedback;
+  store.listFeedback = async (...args) => { store.lists.push(args); return list(...args); };
+  store.setReviewState = store.memory.setReviewState;
+  return store;
+}
+const item = (n) => `item ${n}`;
+const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => item(a + i));
+
+test('inbox show more: ?shown=n renders the first n items as one list, with groups across batches', async () => {
+  const store = longStore(60);
+  await serve(app(store), async (base) => {
+    const first = text(await call(base, '/review'));
+    assert.deepEqual(titles(first), range(1, 25));
+    assert.match(first, /<nav class="more" aria-label="More items"><span>Showing 25 of 60<\/span>\n<a class="btn btn-secondary btn-sm" href="\/review\?shown=50#more-25" data-more>Show more<\/a><\/nav>/);
+    assert.doesNotMatch(first, /Newer|Older|class="pager"/);
+
+    const two = text(await call(base, '/review?shown=50'));
+    assert.deepEqual(titles(two), range(1, 50)); // both batches, newest first, nothing repeated
+    assert.deepEqual(groupsOf(two), ['Earlier50']); // one group spans the batch boundary
+    assert.ok(two.includes(`<li class="task is-open" id="fb-${fid(26)}">`));
+    assert.match(two, new RegExp(`id="fb-${fid(26)}">[\\s\\S]*?<details class="body" id="more-25"><summary><span class="title">item 26<`));
+    assert.equal(two.match(/id="more-/g).length, 1);
+    assert.ok(two.includes('href="/review?shown=75#more-50" data-more>Show more</a>'));
+    assert.ok(two.includes('<span>Showing 50 of 60</span>'));
+    // Every form returns to this list length; tabs, filters, and "Only this API key" start again at one batch.
+    assert.ok(two.includes('<input type="hidden" name="next" value="/review?shown=50">'));
+    assert.ok(!two.includes('name="next" value="/review">'));
+    assert.ok(two.includes('href="/review?select=1&amp;shown=50" data-here>'));
+    assert.deepEqual(views(two).map(([, , , href]) => href), ['/review', '/review?state=done', '/review?state=wontdo', '/review?state=all']);
+    assert.ok(two.includes('href="/review?client=laptop">'));
+
+    const byCat = text(await call(base, '/review?shown=50&group=category'));
+    assert.deepEqual(groupsOf(byCat), ['skills25', 'codebase25']);
+    assert.match(byCat, /<ul class="tasks" data-group="skills" data-order="1">/);
+
+    const end = text(await call(base, '/review?shown=75'));
+    assert.deepEqual(titles(end), range(1, 60));
+    assert.doesNotMatch(end, /<a [^>]*data-more>|<nav class="more"|<p class="more"/);
+    assert.deepEqual(titles(text(await call(base, '/review?shown=37'))), range(1, 50)); // rounds up to a whole batch
+    assert.deepEqual(titles(text(await call(base, '/review?shown=0'))), range(1, 25));
+  });
+  // One query per render, always from the newest item: LIMIT n, no OFFSET.
+  assert.deepEqual(store.lists.map(([owner, f]) => [owner, f.limit, f.page]),
+    [[OWNER, 25, undefined], [OWNER, 50, undefined], [OWNER, 50, undefined], [OWNER, 75, undefined], [OWNER, 50, undefined], [OWNER, 25, undefined]]);
+});
+
+test('inbox show more: the script fetches only the newest batch, owner-scoped', async () => {
+  const store = longStore(60);
+  await serve(app(store), async (base) => {
+    const res = await call(base, '/review?shown=50&state=all', { headers: { 'x-hindsight-batch': '1' } });
+    const html = text(res);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['x-hindsight-batch'], '1');
+    assert.match(res.headers.vary, /X-HindSight-Batch/i);
+    assert.match(res.headers['content-security-policy'], /connect-src 'self'/);
+    assert.ok(!html.includes('<html') && !html.includes('class="toolbar"'));
+    assert.deepEqual(titles(html), range(26, 50));
+    assert.ok(html.startsWith('<h2 class="group">Earlier <span class="n">25</span></h2><ul class="tasks" data-group="Earlier" data-order="2">'));
+    assert.ok(html.includes('<details class="body" id="more-25">'));
+    assert.ok(html.includes('<input type="hidden" name="next" value="/review?state=all&amp;shown=50">'));
+    assert.ok(html.includes('href="/review?state=all&amp;shown=75#more-50" data-more>Show more</a>'));
+    assert.ok(!html.includes('friction 5001'));
+    const last = text(await call(base, '/review?shown=75', { headers: { 'x-hindsight-batch': '1' } }));
+    assert.deepEqual(titles(last), range(51, 60));
+    assert.doesNotMatch(last, /<a [^>]*data-more>/);
+    // Without the header the same URL is the whole page.
+    assert.equal(titles(text(await call(base, '/review?shown=50'))).length, 50);
+  });
+  assert.deepEqual(store.lists.map(([owner, f]) => [owner, f.page, f.limit]), [[OWNER, 1, 25], [OWNER, 2, 25], [OWNER, undefined, 50]]);
+  assert.equal(store.calls.filter((c) => c === 'listTokens').length, 1);
+});
+
+test('inbox show more: capped at 1025 items with a quiet note; old ?page= links map to shown', async () => {
+  const store = longStore(1030);
+  await serve(app(store), async (base) => {
+    for (const path of ['/review?shown=1025', '/review?shown=99999', '/review?page=40', '/review?page=9999']) {
+      const html = text(await call(base, path));
+      assert.equal(titles(html).length, 1025, path);
+      assert.doesNotMatch(html, /<a [^>]*data-more>/, path);
+      assert.ok(html.includes('<p class="more">Showing the newest 1025. Filter by category or API key to reach older items.</p>'), path);
+      assert.ok(html.includes('name="next" value="/review?shown=1025"'), path);
+    }
+    const almost = text(await call(base, '/review?shown=1000'));
+    assert.ok(almost.includes('href="/review?shown=1025#more-1000" data-more>Show more</a>'));
+    // ?page=p shows everything up to the end of that old page, as one list; page itself is dropped.
+    const old = text(await call(base, '/review?page=1&category=skills'));
+    assert.deepEqual(titles(old), Array.from({ length: 50 }, (_, i) => item(2 * i + 1)));
+    assert.ok(old.includes('name="next" value="/review?category=skills&amp;shown=50"'));
+    assert.ok(!old.includes('page='));
+    for (const page of ['-5', 'x', '0']) assert.equal(titles(text(await call(base, '/review?page=' + page))).length, 25, page);
+    // shown wins over page.
+    assert.equal(titles(text(await call(base, '/review?page=3&shown=25'))).length, 25);
+  });
+});
+
+test('inbox show more: state, note, and bulk redirects keep the view, filters, select mode, and shown', async () => {
+  const csrf = csrfToken(SECRET, OWNER);
+  const store = longStore(60);
+  store.updateFeedback = store.memory.updateFeedback;
+  const next = '/review?state=all&category=skills&group=category&shown=50';
+  await serve(app(store), async (base) => {
+    // Still in view: back to the item itself.
+    const kept = await post(base, `/review/${fid(41)}/state`, { state: 'triaged', csrf, next, near: fid(43) });
+    assert.equal(kept.headers.location, `${next}#fb-${fid(41)}`);
+    const page = text(await call(base, kept.headers.location.split('#')[0]));
+    assert.equal(titles(page).length, 30); // all 30 skills items, not the first batch only
+    // Ticked out of the Open view: land on the neighbouring row instead of the top of a long list.
+    const html = text(await call(base, '/review?shown=50'));
+    assert.match(html, new RegExp(`action="/review/${fid(30)}/state"><input type="hidden" name="csrf" value="[^"]+"><input type="hidden" name="next" value="/review\\?shown=50"><input type="hidden" name="near" value="${fid(31)}">`));
+    assert.match(html, new RegExp(`action="/review/${fid(50)}/state">[^]*?name="near" value="${fid(49)}">`));
+    const ticked = await post(base, `/review/${fid(30)}/state`, { state: 'actioned', csrf, next: '/review?shown=50', near: fid(31) });
+    assert.equal(ticked.headers.location, `/review?shown=50#fb-${fid(31)}`);
+    assert.equal(stateOf(store, 30), 'actioned');
+    assert.deepEqual(titles(text(await call(base, '/review?shown=50'))).slice(28, 30), [item(29), item(31)]);
+    for (const near of ['nope', undefined]) {
+      const res = await post(base, `/review/${fid(29)}/state`, { state: 'dismissed', csrf, next: '/review?shown=50', ...(near ? { near } : {}) });
+      assert.equal(res.headers.location, `/review?shown=50#fb-${fid(29)}`);
+    }
+    const note = await post(base, `/review/${fid(41)}/note`, { note: 'later', csrf, next });
+    assert.equal(note.headers.location, `${next}#nt-${fid(41)}`);
+    // Bulk: back to select mode with the same list.
+    const sel = text(await call(base, '/review?select=1&shown=50&client=laptop'));
+    assert.ok(sel.includes('<input type="hidden" name="next" value="/review?client=laptop&amp;select=1&amp;shown=50">'));
+    assert.ok(sel.includes('href="/review?client=laptop&amp;shown=50" data-here>Cancel</a>'));
+    const body = new URLSearchParams([['ids', fid(1)], ['ids', fid(2)], ['state', 'triaged'], ['csrf', csrf], ['next', '/review?client=laptop&select=1&shown=50']]);
+    const bulk = (b) => call(base, '/review/bulk', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', origin: ORIGIN }, body: b.toString() });
+    assert.equal((await bulk(body)).headers.location, '/review?client=laptop&select=1&shown=50');
+    const none = await bulk(new URLSearchParams([['state', 'triaged'], ['csrf', csrf], ['next', '/review?select=1&shown=50']]));
+    assert.equal(none.status, 400);
+    assert.ok(text(none).includes('href="/review?select=1&amp;shown=50">Back to selection'));
+  });
+  assert.deepEqual([1, 2].map((n) => stateOf(store, n)), ['triaged', 'triaged']);
 });

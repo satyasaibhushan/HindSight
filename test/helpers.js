@@ -82,10 +82,10 @@ export function adminMemory(seed = []) {
     (!client || r.client === client) && (states ?? (state ? [state] : null) ?? [r.review_state]).includes(r.review_state);
   return {
     adminRows: rows,
-    // Inbox listing (offset pages of 25) and per-state counts, mirroring db.js.
-    async listFeedback(owner, { page = 0, ...f } = {}) {
+    // Inbox listing (`limit` rows from `page` * 25) and per-state counts, mirroring db.js.
+    async listFeedback(owner, { page = 0, limit = 25, ...f } = {}) {
       const list = own(owner).filter((r) => match(r, f)).slice(page * 25);
-      return { rows: list.slice(0, 25), hasMore: list.length > 25 };
+      return { rows: list.slice(0, limit), hasMore: list.length > limit };
     },
     async countFeedback(owner, { category, client } = {}) {
       const n = Object.fromEntries(REVIEW_STATES.map((s) => [s, 0]));

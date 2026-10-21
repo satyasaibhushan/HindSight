@@ -7,6 +7,8 @@ export const CATEGORIES = ['instructions', 'skills', 'codebase', 'collaboration'
 export const OUTCOMES = ['completed', 'recovered', 'workaround', 'failed', 'blocked', 'unresolved'];
 export const PAGE_SIZE = 25;
 export const MAX_PAGE = 40;
+// The Inbox's cumulative "Show more" list stops here: everything the old ?page=0..MAX_PAGE links could reach.
+export const MAX_SHOWN = (MAX_PAGE + 1) * PAGE_SIZE;
 export const TOKEN_PAGE_SIZE = 50;
 const FEEDBACK_COLUMNS = `id, client, request_id, friction, improvement, category, task, source, repository, outcome,
   confidence, review_state, review_note, reviewed_at, actioned_at, dismissed_at, created_at`;
@@ -108,16 +110,17 @@ export function createPgStore(pool) {
       return { status: same ? 'replayed' : 'conflict', id: rows[0].id, client: rows[0].client };
     },
     // `states` (array) narrows to any of several review states, e.g. the Inbox's Open view (new + triaged);
-    // a single `state` is still accepted.
-    async listFeedback(ownerEmail, { category, state, states, client, page = 0 } = {}) {
+    // a single `state` is still accepted. `limit` (default PAGE_SIZE, up to MAX_SHOWN) rows start at `page` * PAGE_SIZE.
+    async listFeedback(ownerEmail, { category, state, states, client, page = 0, limit = PAGE_SIZE } = {}) {
+      const size = Math.min(Math.max(Number.isInteger(limit) ? limit : PAGE_SIZE, 1), MAX_SHOWN);
       const { rows } = await q(
         `SELECT ${FEEDBACK_COLUMNS} FROM hindsight_feedback
          WHERE owner_email = $1 AND ($2::text IS NULL OR category = $2)
            AND ($3::text[] IS NULL OR review_state = ANY($3)) AND ($4::text IS NULL OR client = $4)
          ORDER BY created_at DESC, id DESC LIMIT $5 OFFSET $6`,
-        [ownerEmail, category ?? null, states ?? (state ? [state] : null), client ?? null, PAGE_SIZE + 1,
+        [ownerEmail, category ?? null, states ?? (state ? [state] : null), client ?? null, size + 1,
           Math.min(Math.max(page, 0), MAX_PAGE) * PAGE_SIZE]);
-      return { rows: rows.slice(0, PAGE_SIZE), hasMore: rows.length > PAGE_SIZE };
+      return { rows: rows.slice(0, size), hasMore: rows.length > size };
     },
     // Per-state totals for the owner's Inbox tabs, honouring the category/key filters. Every state is present.
     async countFeedback(ownerEmail, { category, client } = {}) {

@@ -1,7 +1,7 @@
 import express from 'express';
 import { MAX_BULK, MAX_NOTE, SCOPE_ADMIN, SCOPE_SUBMIT, SCOPES, bulkUpdate, isAdmin } from './admin.js';
 import { adminApi } from './api-v1.js';
-import { MAX_PAGE, REVIEW_STATES } from './db.js';
+import { MAX_PAGE, MAX_SHOWN, PAGE_SIZE, REVIEW_STATES } from './db.js';
 import { CATEGORIES, handleMcp } from './mcp.js';
 import { forwardMcp } from './mcp-http.js';
 import { canonicalHeadersOk, checkCsrf, csrfToken, escapeHtml as e, generateToken, hashToken, safeRelativePath, sameOrigin } from './security.js';
@@ -19,8 +19,9 @@ sign-in, review, and feedback submission stay switched off.</p></div>
 export const GOOGLE_AUTH_ORIGIN = 'https://accounts.google.com';
 const SIGNIN_PAGE = /^\/auth\/signin\/?$/;
 // The only script allowed is the shared inline one in ui.js, pinned by hash.
+// connect-src 'self' lets the Inbox's "Show more" fetch the next batch from /review.
 export const csp = (formAction) =>
-  `default-src 'none'; script-src ${SCRIPT_HASH}; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
+  `default-src 'none'; script-src ${SCRIPT_HASH}; style-src 'unsafe-inline'; connect-src 'self'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
 
 function privateHeaders(req, res, next) {
   res.set({
@@ -187,38 +188,60 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
     dismissed: [['new', 'Reopen', 'undo'], ['actioned', 'Mark done', 'check']],
   };
   const MENU = { new: ACTIONS.new.slice(0, 2), triaged: ACTIONS.triaged.slice(0, 2), actioned: ACTIONS.actioned, dismissed: ACTIONS.dismissed.slice(0, 1) };
-
-  app.get('/review', requireReviewer, async (req, res) => {
-    const state = pick(req.query.state, STATE_PARAMS);
+  // ?state= -> the view, an optional single-state narrowing, and the DB states listed (undefined = all).
+  const viewOf = (raw) => {
+    const state = pick(raw, STATE_PARAMS);
     const view = VIEW_OF[state] ?? state ?? 'open';
     const narrow = state === 'new' || state === 'triaged' ? state : undefined;
+    return { state, view, narrow, states: narrow ? [narrow] : VIEWS[view] };
+  };
+  // "Show more" is cumulative: ?shown=<n> renders the newest n items (PAGE_SIZE steps, up to MAX_SHOWN) as one
+  // list. An old ?page=<p> link maps to the same items it used to reach the end of: shown = (p + 1) * PAGE_SIZE.
+  const shownOf = (q) => {
+    const n = Number.parseInt(q.shown, 10);
+    const steps = n > 0 ? Math.ceil(n / PAGE_SIZE) : Math.min(Math.max(Number.parseInt(q.page, 10) || 0, 0), MAX_PAGE) + 1;
+    return Math.min(steps * PAGE_SIZE, MAX_SHOWN);
+  };
+  const BATCH = 'X-HindSight-Batch';
+
+  app.get('/review', requireReviewer, async (req, res) => {
+    const { state, view, narrow, states } = viewOf(req.query.state);
     const filters = {
       category: pick(req.query.category, CATEGORIES),
-      states: narrow ? [narrow] : VIEWS[view],
+      states,
       client: typeof req.query.client === 'string' && /^.{1,80}$/.test(req.query.client) ? req.query.client : undefined,
-      page: Math.min(Math.max(Number.parseInt(req.query.page, 10) || 0, 0), MAX_PAGE),
     };
+    const shown = shownOf(req.query);
+    // The inline script asks for just the newest batch (header BATCH) and appends it; otherwise the whole list.
+    const batch = req.get(BATCH) === '1';
     const group = pick(req.query.group, GROUPS) ?? 'date';
     const select = req.query.select === '1';
     const owner = req.reviewer.email;
     const [{ rows, hasMore }, counts, keys] = await Promise.all([
-      store.listFeedback(owner, filters),
+      store.listFeedback(owner, batch ? { ...filters, page: shown / PAGE_SIZE - 1, limit: PAGE_SIZE } : { ...filters, limit: shown }),
       store.countFeedback(owner, { category: filters.category, client: filters.client }),
-      store.listTokens(owner, {}),
+      batch ? { rows: [] } : store.listTokens(owner, {}),
     ]);
     const csrf = e(csrfToken(config.authSecret, owner));
     const params = { state: state === 'open' ? undefined : state, category: filters.category, client: filters.client,
-      group: group === 'date' ? undefined : group, page: String(filters.page), select: select ? '1' : undefined };
+      group: group === 'date' ? undefined : group, select: select ? '1' : undefined, shown: shown === PAGE_SIZE ? undefined : String(shown) };
     const qs = (over) => '/review' + ((q) => (q ? '?' + q : ''))(new URLSearchParams(Object.entries({ ...params, ...over })
-      .filter(([, v]) => v !== undefined && v !== '' && v !== '0')).toString());
+      .filter(([, v]) => v !== undefined && v !== '')).toString());
+    // Every form returns here: same view, filters, grouping, select mode, and length of list.
     const here = qs({});
     const hidden = (name, value) => `<input type="hidden" name="${name}" value="${e(value)}">`;
-    const stateForm = (id, cls, inner) => `<form${cls ? ` class="${cls}"` : ''} method="post" action="/review/${id}/state">${hidden('csrf', csrf)}${hidden('next', here)}${inner}</form>`;
+    // `near`: the neighbouring row, where the redirect lands if this item leaves the view.
+    const stateForm = (id, cls, inner, near) => `<form${cls ? ` class="${cls}"` : ''} method="post" action="/review/${id}/state">${hidden('csrf', csrf)}${hidden('next', here)}${near ? hidden('near', near) : ''}${inner}</form>`;
     const fact = (label, v) => (v ? `<div><dt>${label}</dt><dd>${e(v)}</dd></div>` : '');
     const SEP = '<span class="sep">·</span>';
 
-    const row = (f) => {
+    const offset = batch ? shown - PAGE_SIZE : 0;
+    const index = new Map(rows.map((f, i) => [f.id, offset + i]));
+    const row = (f, i, all) => {
       const id = e(f.id);
+      const near = (all[i + 1] ?? all[i - 1])?.id;
+      // The first item of each later batch is where "Show more" lands without JS.
+      const at = index.get(f.id);
       const s = f.review_state;
       const done = s === 'actioned';
       const glyph = s === 'triaged' ? ' planned' : s === 'dismissed' ? ' wontdo' : '';
@@ -226,18 +249,18 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
       const box = `<span class="box">${icon('check')}</span>`;
       const lead = select
         ? `<label class="sel"><input type="checkbox" name="ids" value="${id}" form="bulk" aria-label="Select: ${e(f.improvement.slice(0, 80))}">${box}</label>`
-        : stateForm(id, 'chk-form', `<button class="chk${glyph}" type="submit" name="state" value="${done || s === 'dismissed' ? 'new' : 'actioned'}" role="checkbox" aria-checked="${done}" aria-label="${label}">${box}</button>`);
+        : stateForm(id, 'chk-form', `<button class="chk${glyph}" type="submit" name="state" value="${done || s === 'dismissed' ? 'new' : 'actioned'}" role="checkbox" aria-checked="${done}" aria-label="${label}">${box}</button>`, near);
       const tag = s === 'triaged' ? `<span class="tag planned">Planned</span>${SEP}` : s === 'dismissed' ? `<span class="tag wontdo">Won’t do</span>${SEP}` : '';
       const note = f.review_note ? `${SEP}<span class="tag hasnote">Has note</span>` : '';
       const facts = fact('Repository', f.repository) + fact('Task', f.task) + fact('Source', f.source) + fact('Outcome', f.outcome) + fact('Confidence', f.confidence);
       const buttons = ACTIONS[s] ?? ACTIONS.new;
       const actions = stateForm(id, 'actions', buttons.map(([to, text, ico, primary]) =>
-        `<button class="btn${primary ? '' : ' btn-secondary'} btn-sm" name="state" value="${to}">${icon(ico)}${text}</button>`).join(''));
+        `<button class="btn${primary ? '' : ' btn-secondary'} btn-sm" name="state" value="${to}">${icon(ico)}${text}</button>`).join(''), near);
       const menu = select ? '<span></span>' : `<details class="menu"><summary aria-label="More actions">${icon('dots')}</summary><div class="menu-panel">
-${stateForm(id, '', (MENU[s] ?? MENU.new).map(([to, text, ico]) => `<button name="state" value="${to}">${icon(ico)}${text}</button>`).join(''))}<hr>
-<a href="${e(qs({ client: f.client, page: '0' }))}">${icon('key')}Only this API key</a><button type="button" class="copy" data-copy="rq-${id}">${icon('copy')}<span class="copy-label">Copy request id</span></button></div></details>`;
+${stateForm(id, '', (MENU[s] ?? MENU.new).map(([to, text, ico]) => `<button name="state" value="${to}">${icon(ico)}${text}</button>`).join(''), near)}<hr>
+<a href="${e(qs({ client: f.client, shown: undefined }))}">${icon('key')}Only this API key</a><button type="button" class="copy" data-copy="rq-${id}">${icon('copy')}<span class="copy-label">Copy request id</span></button></div></details>`;
       return `<li class="task is-${{ new: 'open', triaged: 'planned', actioned: 'done', dismissed: 'wontdo' }[s] ?? 'open'}" id="fb-${id}">${lead}
-<details class="body"><summary><span class="title">${e(f.improvement)}</span>
+<details class="body"${at && at % PAGE_SIZE === 0 ? ` id="more-${at}"` : ''}><summary><span class="title">${e(f.improvement)}</span>
 <span class="meta">${tag}<span class="cat">${e(f.category)}</span>${SEP}<span class="src">${e(f.client)}</span>${SEP}${ago(f.created_at)}${note}<span class="chev"><span>Details</span>${icon('chev')}</span></span></summary>
 <div class="detail"><h3>Friction</h3><p class="prose">${e(f.friction)}</p>${facts ? `<dl class="facts">${facts}</dl>` : ''}
 <form class="note" id="nt-${id}" method="post" action="/review/${id}/note">${hidden('csrf', csrf)}${hidden('next', here)}
@@ -247,24 +270,37 @@ ${stateForm(id, '', (MENU[s] ?? MENU.new).map(([to, text, ico]) => `<button name
 ${menu}</li>`;
     };
 
-    // Groups on this page: by UTC day (Today / Yesterday / Earlier), by category, or none.
+    // Groups over the whole list: by UTC day (Today / Yesterday / Earlier), by category, or none. data-group and
+    // data-order let the script merge an appended batch into the matching group or slot a new one in place.
+    const DAYS = ['Today', 'Yesterday', 'Earlier'];
     const groups = new Map();
     for (const f of rows) {
       const days = dayDiff(f.created_at);
-      const key = group === 'none' ? '' : group === 'category' ? f.category : days <= 0 ? 'Today' : days === 1 ? 'Yesterday' : 'Earlier';
+      const key = group === 'none' ? '' : group === 'category' ? f.category : DAYS[Math.min(Math.max(days, 0), 2)];
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(f);
     }
     const order = group === 'category' ? CATEGORIES.filter((c) => groups.has(c)) : [...groups.keys()];
+    const flat = order.flatMap((k) => groups.get(k));
+    const pos = new Map(flat.map((f, i) => [f.id, i]));
+    const rank = (k) => Math.max((group === 'category' ? CATEGORIES : DAYS).indexOf(k), 0);
     const list = order.map((k) => (k ? `<h2 class="group">${e(k)} <span class="n">${groups.get(k).length}</span></h2>` : '') +
-      `<ul class="tasks">${groups.get(k).map(row).join('')}</ul>`).join('');
+      `<ul class="tasks" data-group="${e(k)}" data-order="${rank(k)}">${groups.get(k).map((f) => row(f, pos.get(f.id), flat)).join('')}</ul>`).join('');
 
     const n = { open: counts.new + counts.triaged, done: counts.actioned, wontdo: counts.dismissed,
       all: REVIEW_STATES.reduce((t, s) => t + counts[s], 0) };
-    const tabs = Object.keys(VIEWS).map((v) => `<a href="${e(qs({ state: v === 'open' ? undefined : v, page: '0' }))}"${v === view ? ' aria-current="page"' : ''}>${VIEW_LABEL[v]} <span class="n">${n[v]}</span></a>`).join('');
+    const total = narrow ? counts[narrow] : n[view];
+    const loaded = offset + rows.length;
+    const more = hasMore && shown < MAX_SHOWN
+      ? `<nav class="more" aria-label="More items"><span>Showing ${loaded} of ${Math.max(total, loaded + 1)}</span>
+<a class="btn btn-secondary btn-sm" href="${e(qs({ shown: String(shown + PAGE_SIZE) }) + '#more-' + shown)}" data-more>Show more</a></nav>`
+      : hasMore ? `<p class="more">Showing the newest ${loaded}. Filter by category or API key to reach older items.</p>` : '';
+    if (batch) return res.set(BATCH, '1').vary(BATCH).send(list + more);
+    res.vary(BATCH);
+    const tabs = Object.keys(VIEWS).map((v) => `<a href="${e(qs({ state: v === 'open' ? undefined : v, shown: undefined }))}"${v === view ? ' aria-current="page"' : ''}>${VIEW_LABEL[v]} <span class="n">${n[v]}</span></a>`).join('');
     const clients = [...new Set([...keys.rows.map((t) => t.client), ...(filters.client ? [filters.client] : [])])];
     const toolbar = `<div class="toolbar"><nav class="views" aria-label="View">${tabs}</nav>
-${select ? '' : `<a class="btn btn-ghost btn-sm" href="${e(qs({ select: '1' }))}">${icon('list')}Select</a>`}</div>
+${select ? '' : `<a class="btn btn-ghost btn-sm" href="${e(qs({ select: '1' }))}" data-here>${icon('list')}Select</a>`}</div>
 <form class="filters" method="get" action="/review" role="search" aria-label="Filter items">
 ${params.state ? hidden('state', params.state) : ''}${select ? hidden('select', '1') : ''}
 <label class="sr" for="f-cat">Category</label><select id="f-cat" name="category" data-autosubmit>${options(filters.category, CATEGORIES, 'Category: all')}</select>
@@ -272,13 +308,13 @@ ${params.state ? hidden('state', params.state) : ''}${select ? hidden('select', 
 <label class="sr" for="f-grp">Group by</label><select id="f-grp" name="group" data-autosubmit><option value="">Group: date</option>
 <option value="category"${group === 'category' ? ' selected' : ''}>Group: category</option><option value="none"${group === 'none' ? ' selected' : ''}>No grouping</option></select>
 <button class="btn btn-secondary btn-sm apply">Apply</button></form>
-${narrow ? `<p class="narrow">Showing only ${STATE_NAME[narrow]} items.<a href="${e(qs({ state: undefined, page: '0' }))}">Show all open</a></p>` : ''}`;
+${narrow ? `<p class="narrow">Showing only ${STATE_NAME[narrow]} items.<a href="${e(qs({ state: undefined, shown: undefined }))}">Show all open</a></p>` : ''}`;
     const bulkbar = select ? `<form id="bulk" class="bulkbar" method="post" action="/review/bulk" role="group" aria-label="Bulk actions">
-${hidden('csrf', csrf)}${hidden('next', qs({ select: undefined }))}<span class="count" data-count aria-live="polite">Select items</span>
+${hidden('csrf', csrf)}${hidden('next', here)}<span class="count" data-count aria-live="polite">Select items</span>
 <button class="btn btn-sm" name="state" value="actioned">${icon('check')}Mark done</button>
 <button class="btn btn-secondary btn-sm" name="state" value="triaged">${icon('target')}Plan</button>
 <button class="btn btn-secondary btn-sm" name="state" value="dismissed">${icon('x')}Won’t do</button><span class="spacer"></span>
-<a class="btn btn-ghost btn-sm" href="${e(qs({ select: undefined }))}">Cancel</a></form>` : '';
+<a class="btn btn-ghost btn-sm" href="${e(qs({ select: undefined }))}" data-here>Cancel</a></form>` : '';
 
     let empty = '';
     if (!rows.length) {
@@ -286,14 +322,12 @@ ${hidden('csrf', csrf)}${hidden('next', qs({ select: undefined }))}<span class="
         ? emptyState('inbox', 'No feedback yet', 'When an agent connected with one of your API keys finishes a task, its suggestions land here.',
           `<a class="btn" href="/connect">${icon('plug')}Connect a client</a>`)
         : filters.category || filters.client
-          ? emptyState('', 'Nothing matches these filters', 'Try another category or API key.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ category: undefined, client: undefined, page: '0' }))}">Clear filters</a>`)
-          : view === 'open' && !narrow && !filters.page
-            ? emptyState('', 'All clear', 'Nothing open. New suggestions land here when an agent finishes a task.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ state: 'done', page: '0' }))}">See what’s done</a>`)
-            : emptyState('', 'Nothing here', 'No items in this view.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ state: 'all', page: '0' }))}">Show all</a>`);
+          ? emptyState('', 'Nothing matches these filters', 'Try another category or API key.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ category: undefined, client: undefined, shown: undefined }))}">Clear filters</a>`)
+          : view === 'open' && !narrow
+            ? emptyState('', 'All clear', 'Nothing open. New suggestions land here when an agent finishes a task.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ state: 'done', shown: undefined }))}">See what’s done</a>`)
+            : emptyState('', 'Nothing here', 'No items in this view.', `<a class="btn btn-secondary btn-sm" href="${e(qs({ state: 'all', shown: undefined }))}">Show all</a>`);
     }
-    const pager = (filters.page > 0 ? `<a class="btn btn-secondary btn-sm" href="${e(qs({ page: String(filters.page - 1) }))}">Newer</a>` : '') +
-      (hasMore && filters.page < MAX_PAGE ? `<a class="btn btn-secondary btn-sm" href="${e(qs({ page: String(filters.page + 1) }))}">Older</a>` : '');
-    res.send(shell('Inbox', toolbar + bulkbar + (list || empty) + (pager ? `<nav class="pager" aria-label="Pages">${pager}</nav>` : ''),
+    res.send(shell('Inbox', toolbar + bulkbar + (list || empty) + more,
       ui(req, '/review', { sub: 'What your agents suggest you change. Tick an item when it is done. Each item is attributable to the API key that sent it.' })));
   });
 
@@ -301,7 +335,10 @@ ${hidden('csrf', csrf)}${hidden('next', qs({ select: undefined }))}<span class="
     const state = pick(req.body.state, REVIEW_STATES);
     if (!UUID.test(req.params.id) || !state) return problem(req, res, 400, 'Invalid request', 'That review state is not valid.');
     if (!await store.setReviewState(req.reviewer.email, req.params.id, state)) return problem(req, res, 404, 'Not found', 'That feedback item does not exist.');
-    res.redirect(303, backToItem(req));
+    // An item that leaves the view (e.g. ticked in Open) is gone after the redirect: land on its neighbour.
+    const { states } = viewOf(new URLSearchParams(nextOf(req).split('?')[1] ?? '').get('state'));
+    const near = typeof req.body.near === 'string' && UUID.test(req.body.near) ? req.body.near : null;
+    res.redirect(303, !states || states.includes(state) || !near ? backToItem(req) : `${nextOf(req)}#fb-${near}`);
   });
 
   // Bulk select mode: one form, up to MAX_BULK owner-scoped ids, one atomic store update. Ids that are not the
@@ -314,7 +351,8 @@ ${hidden('csrf', csrf)}${hidden('next', qs({ select: undefined }))}<span class="
       return problem(req, res, 400, 'Invalid request', 'That bulk change is not valid.');
     }
     if (!ids.length || ids.length > MAX_BULK) {
-      return problem(req, res, 400, 'Invalid request', `Select between 1 and ${MAX_BULK} items.`, [nextOf(req) + (nextOf(req).includes('?') ? '&' : '?') + 'select=1', 'Back to selection']);
+      const back = /[?&]select=1(&|$)/.test(nextOf(req)) ? nextOf(req) : nextOf(req) + (nextOf(req).includes('?') ? '&' : '?') + 'select=1';
+      return problem(req, res, 400, 'Invalid request', `Select between 1 and ${MAX_BULK} items.`, [back, 'Back to selection']);
     }
     await bulkUpdate(store, req.reviewer.email, ids, state);
     res.redirect(303, nextOf(req));

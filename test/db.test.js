@@ -651,6 +651,37 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       await assert.rejects(store.listFeedbackPage(owner, { before: 'not-a-uuid' }));
     });
 
+    test('inbox listing: limit gives one cumulative list from the newest item, and batches line up with it', async () => {
+      const owner = 'inbox-more@example.com';
+      const pool = schemaPool(schema);
+      const t = await token(store, owner, 'laptop');
+      const ids = [];
+      for (let i = 0; i < 60; i += 1) {
+        ids.push((await submit(store, t.auth, feedback(`more-${String(i).padStart(4, '0')}`, { category: i % 2 ? 'skills' : 'codebase' }))).id);
+      }
+      // Shared created_at: batch boundaries rely on the id tiebreak.
+      await pool.query(`UPDATE hindsight_feedback SET created_at = now() - interval '1 day' WHERE owner_email = $1`, [owner]);
+      const theirs = await submit(store, (await token(store, 'inbox-more-other@example.com')).auth, feedback('more-intruder'));
+      const list = (f) => store.listFeedback(owner, f).then(({ rows, hasMore }) => ({ ids: rows.map((r) => r.id), hasMore }));
+      const two = await list({ limit: 50 });
+      assert.equal(two.ids.length, 50);
+      assert.equal(two.hasMore, true);
+      assert.equal(new Set(two.ids).size, 50);
+      // The cumulative list is exactly batch 1 followed by batch 2, and the old default is unchanged.
+      const [b1, b2] = [await list({}), await list({ page: 1, limit: 25 })];
+      assert.deepEqual([...b1.ids, ...b2.ids], two.ids);
+      assert.equal(b1.hasMore, true);
+      assert.deepEqual(await list({ page: 1 }), b2);
+      assert.deepEqual(await list({ limit: 75 }), { ids: [...two.ids, ...(await list({ page: 2 })).ids], hasMore: false });
+      assert.equal((await list({ limit: 75 })).ids.length, 60);
+      assert.deepEqual((await list({ limit: 75, category: 'skills', states: ['new'] })).ids.length, 30);
+      // Limits are clamped in storage too; the other owner's row never appears.
+      assert.equal((await list({ limit: 0 })).ids.length, 1);
+      assert.equal((await list({ limit: 5000 })).ids.length, 60);
+      assert.ok(!(await list({ limit: 1025 })).ids.includes(theirs.id));
+      assert.deepEqual((await store.listFeedback('inbox-more-other@example.com', { limit: 1025 })).rows.map((r) => r.id), [theirs.id]);
+    });
+
     test('admin get, update, and bulk are owner-isolated; state timestamps and notes', async () => {
       const owner = 'admin-update@example.com';
       const other = 'admin-other@example.com';
