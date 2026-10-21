@@ -53,6 +53,25 @@ const seed = (owner = OWNER) => ITEMS.map(([created_at, client, category, review
   request_id: `${client.split(' ')[0].toLowerCase()}-${created_at.toISOString().slice(0, 10)}-${(0x7f3a9c + i * 4099).toString(16)}`,
   review_note: review_note ?? null, ...ctx,
 }));
+// Older filler for the "Show more" shot: 50 more items, one every ~16 hours from day 10 back.
+const FILLER = [
+  ['codebase', 'Extract the retry loop in src/sync/*.ts into one helper with jittered backoff; three copies have drifted.'],
+  ['instructions', 'Say in CLAUDE.md which package manager the repo uses; agents guess between npm and pnpm.'],
+  ['skills', 'Give the changelog skill a dry-run mode that prints the entry instead of committing it.'],
+  ['tooling', 'Add a `make lint-fix` target so agents do not have to remember the eslint and prettier flags.'],
+  ['documentation', 'Document the feature-flag naming convention next to the flags file.'],
+  ['collaboration', 'Note in the PR template whether screenshots are expected for UI changes.'],
+  ['environment', 'Set TZ=UTC in the test environment; two snapshot tests depend on the machine time zone.'],
+  ['workflow', 'Run the slow e2e suite only on PRs labelled `e2e`, and say so in CONTRIBUTING.md.'],
+];
+const filler = (owner = OWNER) => Array.from({ length: 50 }, (_, i) => {
+  const [category, improvement] = FILLER[i % FILLER.length];
+  const client = [LAPTOP, CODEX, CURSOR][i % 3];
+  const created_at = ago(10 * 1440 + i * 970);
+  return { id: id(300 + i), owner_email: owner, client, category, improvement, created_at,
+    review_state: ['new', 'new', 'actioned', 'triaged', 'new', 'dismissed', 'actioned'][i % 7],
+    friction: 'Found while working on an unrelated task.', request_id: `filler-${created_at.toISOString().slice(0, 10)}-${i}` };
+});
 const TOKENS = [
   ['Work laptop — Claude Code', 'feedback:submit', 3, 12, 26], ['Codex on build box', 'feedback:submit', 9, 300, 51],
   ['Weekly digest script', 'feedback:admin', 32, 8 * 1440, -2], ['Cursor — home desktop', 'feedback:submit', 20, null, 9],
@@ -103,7 +122,7 @@ const browser = await chromium.launch();
 const DESKTOP = { viewport: { width: 1280, height: 860 } };
 const MOBILE = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
 
-async function shot(name, base, path, { device = DESKTOP, colorScheme = 'light', prepare, selector } = {}) {
+async function shot(name, base, path, { device = DESKTOP, colorScheme = 'light', prepare, selector, fullPage = true } = {}) {
   if (only && !name.includes(only)) return;
   const ctx = await browser.newContext({ ...device, colorScheme });
   const page = await ctx.newPage();
@@ -114,7 +133,7 @@ async function shot(name, base, path, { device = DESKTOP, colorScheme = 'light',
   if (selector) {
     await page.addStyleTag({ content: '.topbar{position:static!important}' });
     await page.locator(selector).screenshot({ path: file });
-  } else await page.screenshot({ path: file, fullPage: true });
+  } else await page.screenshot({ path: file, fullPage });
   await ctx.close();
   console.log('wrote', `docs/screenshots/after/${name}.png`);
 }
@@ -130,6 +149,15 @@ const setup = await start({ configured: false });
 // Shots that create a key get their own server, so one shot's new key does not show up in another.
 const servers = [];
 const fresh = async () => { servers.push(await start()); return servers.at(-1); };
+const long = await start({ rows: [...seed(), ...filler()] });
+// Click "Show more" once: the script appends the next batch in place, into the same Earlier group.
+const showMore = async (page) => {
+  await page.click('[data-more]');
+  await page.waitForSelector('#more-25');
+  await page.evaluate(() => { document.activeElement.blur(); scrollTo(0, 0); });
+  await page.mouse.move(0, 0);
+};
+const showMoreEnd = async (page) => { await showMore(page); await page.locator('.more').scrollIntoViewIfNeeded(); };
 const allClear = await start({ rows: seed().map((r) => ({ ...r, review_state: r.review_state === 'dismissed' ? 'dismissed' : 'actioned' })) });
 try {
   await shot('01-setup-required', setup.base, '/review');
@@ -169,7 +197,9 @@ try {
   await shot('19-inbox-mobile-bulk', main.base, '/review?select=1', { device: MOBILE, prepare: async (page) => {
     for (const box of (await page.locator('.sel input').all()).slice(0, 2)) await box.check();
   } });
+  await shot('20-inbox-show-more', long.base, '/review?state=all', { prepare: showMore });
+  await shot('21-inbox-show-more-mobile', long.base, '/review?state=all', { device: MOBILE, prepare: showMoreEnd, fullPage: false });
 } finally {
   await browser.close();
-  for (const s of [main, anon, setup, allClear, ...servers]) s.close();
+  for (const s of [main, anon, setup, allClear, long, ...servers]) s.close();
 }

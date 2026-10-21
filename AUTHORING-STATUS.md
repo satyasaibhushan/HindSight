@@ -152,6 +152,30 @@ Branch `revamp/checklist-admin-keys`, on top of the admin-keys backend. Follows 
   Chromium check at 390px found no horizontal scroll on any page and no CSP console errors, with and without
   JavaScript. The no-JS tick and bulk round trips also worked.
 
+## Inbox "Show more" (authored and run locally in this session; not yet operator-verified)
+
+Branch `fix/inbox-load-more`. Owner bug: Newer/Older swapped the whole list instead of adding to it.
+
+- `/review` pages by `?shown=n` (cumulative, 25-item steps, cap `MAX_SHOWN` = `(MAX_PAGE+1)*PAGE_SIZE` = 1,025) in place
+  of `?page=`; the Newer button is gone, and at the cap a note suggests filtering. Old `?page=p` maps to `shown=(p+1)*25`.
+- No JS: "Show more" links to `?shown=n+25#more-n` (`id="more-n"` on the first item of each later batch). With JS: the
+  inline script fetches only the new batch (`X-HindSight-Batch: 1`), merges rows by `data-group`/`data-order`, skips ids
+  already shown, swaps the footer, `replaceState`s `shown`, and rewrites every `next` input and `data-here` link. On any
+  failure it falls back to the plain link. CSP gains `connect-src 'self'` (exact-CSP test and README updated).
+- Redirects: every form's `next` is the full current URL, so state, note, and bulk changes keep the tab, filters,
+  grouping, `shown`, and select mode (bulk used to drop select mode). A state change that moves the item out of the
+  view lands on a neighbouring row (`near`) instead of the top of a long list.
+- Store: `listFeedback` takes an optional `limit` (default 25, clamped 1–1,025); the default call is unchanged and owner
+  scoping is untouched. Full renders use `LIMIT n+1` from offset 0; the script's batch uses `LIMIT 26 OFFSET n`.
+- Tests: pager assertions updated; new tests cover cumulative order and groups across batches, the batch fragment,
+  the cap and note, old `?page=` mapping, and redirects keeping `shown`, filters, and select mode. `test/db.test.js`
+  checks that `limit` equals the batches concatenated, and covers clamping and owner isolation on PostgreSQL.
+- Screenshots `20-inbox-show-more` and `21-inbox-show-more-mobile` added; the other screenshots are visually unchanged
+  (the sample inbox has fewer than 25 items) and were not regenerated. A headless Chromium run checked the JS append
+  with date, category, and no grouping against the server render of the same URL, with no console or CSP errors.
+- Run (Node 22.22): `npm run check` passed; `npm test` 85/85; `npm run test:db` 31/31 on local PostgreSQL 16
+  `hindsight_test`; `npm test` with the DB URL set 113/113, none skipped.
+
 ## Operator-run diagnostics (reported to the author, not run by the author)
 
 - slice004: clean install, syntax check, 41 tests, and `npm audit` (0) passed. Manual checks on isolated

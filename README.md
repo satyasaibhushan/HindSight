@@ -40,11 +40,12 @@ plus the retained `connector`, `tooling`, `environment`, `documentation`, `workf
   "Use an admin key" section (`/connect#admin`) with the admin MCP tools and `/api/v1` examples.
 - `/health` — reports `ok` or `setup-required`; no secrets.
 
-All pages send `Content-Security-Policy` with `default-src 'none'` and `form-action 'self'`. The one exception
-is the sign-in page (`/auth/signin`), which also allows `https://accounts.google.com` so its Google redirect
-can complete. The only script is one small inline progressive-enhancement script (copy buttons, revoke
-confirmation, filter auto-submit, closing the `⋯` menu on an outside click or Escape, the live "N selected" count, and
-opening an item after its note is saved), allowed by its SHA-256 hash; every page works without it. Icons and the
+All pages send `Content-Security-Policy` with `default-src 'none'`, `connect-src 'self'`, and `form-action 'self'`.
+The one exception is the sign-in page (`/auth/signin`), which also allows `https://accounts.google.com` so its Google
+redirect can complete. The only script is one small inline progressive-enhancement script (copy buttons, revoke
+confirmation, filter auto-submit, closing the `⋯` menu on an outside click or Escape, the live "N selected" count,
+opening an item after its note is saved, and the Inbox's in-place "Show more", which is the only reason for
+`connect-src 'self'`: it fetches the next batch from `/review`), allowed by its SHA-256 hash; every page works without it. Icons and the
 Google logo are inline SVG, so nothing external is loaded. (Auth.js's built-in sign-in page loaded its Google
 logo from `authjs.dev`, which this CSP blocked, leaving a broken image in the button.)
 
@@ -74,11 +75,18 @@ native `<details>` panel. Every control is a plain form POST or link, so the pag
 - **Filters**: category, API key, and grouping (`?group=` omitted for date, `category`, or `none`). Date groups are
   Today / Yesterday / Earlier by UTC calendar day. The selects auto-submit with JavaScript; an Apply button covers the rest.
 - **Row actions**: the `⋯` menu (a `<details>`) offers Plan/Unplan, Won't do or Reopen, "Only this API key", and copy
-  request id. After a change the page returns to the same view, scrolled to and marking the changed row.
+  request id. After a change the page returns to the same view (tab, filters, grouping, select mode, and list length),
+  scrolled to the changed row, or to its neighbour if the change moved it out of the view (e.g. ticked in Open).
 - **Bulk select** (`?select=1`): every row gets a real checkbox tied to one form that POSTs `ids` and `state` to
   `/review/bulk`. It is CSRF- and origin-checked like every other form, takes 1–100 well-formed ids (anything else is
   `400`), and uses the same owner-scoped atomic store update as the admin API, so another owner's ids are never changed.
-- **Pages**: 25 items per page with Newer/Older links (`?page=`), as before.
+- **Show more** (`?shown=n`): the list grows in batches of 25 instead of paging. `?shown=n` renders the newest `n` items
+  (rounded up to a whole batch) as one list, so date and category groups span every batch, from one owner-scoped
+  `LIMIT n+1` query with no `OFFSET`. Without JavaScript, "Show more" links to `?shown=n+25#more-n`, which lands on the
+  first new item. With it, the link fetches only the new batch (header `X-HindSight-Batch: 1`; `LIMIT 26 OFFSET n`),
+  merges the rows into matching groups or inserts new group sections, and `replaceState`s the new `shown` into the URL
+  and every form's return path. The list stops at 1,025 items (the reach of the old pages 0–40) with a note to filter.
+  Old `?page=p` links map to `shown=(p+1)*25`; `shown` wins if both are given.
 
 ## Status: setup-required
 
@@ -116,7 +124,7 @@ the port. There are no demo users, tokens, or auth-bypass switches.
   and synthetic `.invalid` config; they need no database.
 - `node scripts/screenshots.js` regenerates `docs/screenshots/after/*.png`: it boots the real app on the in-memory test
   store with synthetic config, a fixed signed-in reviewer, and seeded sample data, and captures it with Playwright
-  (desktop, 390px mobile, light and dark). Playwright is not a project dependency: it needs a local Playwright and
+  (desktop, 390px mobile, light and dark; `20`/`21` show the Inbox after "Show more"). Playwright is not a project dependency: it needs a local Playwright and
   Chromium (`PLAYWRIGHT_MODULE` may point at its entry file). It never touches a database.
 - `test/db.test.js` (migrations, persistence, category roundtrip and filtering, owner isolation,
   expiry/revocation, idempotency, throttling, token keyset paging over more than 100 tokens, admin scope,
