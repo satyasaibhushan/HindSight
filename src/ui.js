@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { escapeHtml as e } from './security.js';
 
 // Shared UI: design tokens, layout shell, icons, and the one inline script. Everything is inline so the
-// CSP stays `default-src 'none'`: styles via 'unsafe-inline', the script pinned by its SHA-256 hash.
+// CSP stays `default-src 'none'`: styles via 'unsafe-inline', the script pinned by its SHA-256 hash, and only
+// same-origin fetches (connect-src 'self', for the Inbox's "Show more").
 
 const STYLE = `:root{color-scheme:light dark;--bg:#f7f7f8;--surface:#fff;--surface-2:#f2f2f4;--surface-3:#e9e9ec;--border:#e5e5e9;--border-strong:#cdcdd4;
 --text:#17171c;--text-2:#4e4e58;--muted:#6f6f7b;--faint:#a9a9b3;--accent:#4f46e5;--accent-hover:#4338ca;--accent-soft:#eceefc;--accent-text:#3b34b5;--on-accent:#fff;
@@ -165,6 +166,8 @@ details.body>summary:hover .chev{color:var(--muted)}
 .empty h2{font-size:var(--fs-md);margin-bottom:4px}
 .empty p{color:var(--muted);margin:0 auto 14px;max-width:44ch;font-size:var(--fs)}
 .pager{display:flex;justify-content:center;gap:8px;margin-top:20px}
+.more{display:flex;flex-direction:column;align-items:center;gap:8px;margin:16px 0 0;font-size:var(--fs-sm);color:var(--muted);text-align:center}
+.more [aria-busy=true]{opacity:.6;pointer-events:none}.task [id^="more-"]{scroll-margin-top:78px}
 .alert{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:var(--radius);border:1px solid;margin-bottom:16px;font-size:var(--fs);color:var(--text)}
 .alert.ok{background:var(--ok-soft);border-color:color-mix(in srgb,var(--ok) 30%,transparent)}
 .alert.err{background:var(--danger-soft);border-color:color-mix(in srgb,var(--danger) 30%,transparent)}
@@ -309,7 +312,20 @@ d.addEventListener('submit',(ev)=>{const m=ev.target.dataset.confirm;if(m&&!conf
 d.addEventListener('change',(ev)=>{const f=ev.target.form;if(!f||f.id!=='bulk')return;const n=[...f.elements].filter((x)=>x.name==='ids'&&x.checked).length;
 f.querySelector('[data-count]').textContent=n?n+' selected':'Select items'});
 const t=location.hash.startsWith('#nt-')&&d.getElementById(location.hash.slice(1));if(t)t.closest('details').open=true;
-d.querySelectorAll('[data-autosubmit]').forEach((el)=>el.addEventListener('change',()=>el.form.requestSubmit()));})();`;
+d.querySelectorAll('[data-autosubmit]').forEach((el)=>el.addEventListener('change',()=>el.form.requestSubmit()));
+d.addEventListener('click',async(ev)=>{const a=ev.target.closest('a[data-more]');if(!a||ev.button||ev.metaKey||ev.ctrlKey||ev.shiftKey||ev.altKey)return;
+ev.preventDefault();if(a.hasAttribute('aria-busy'))return;a.setAttribute('aria-busy','true');const nav=a.closest('.more'),url=a.pathname+a.search;
+try{const r=await fetch(url,{headers:{'X-HindSight-Batch':'1'}});if(!r.ok||r.headers.get('X-HindSight-Batch')!=='1')throw 0;
+const t=d.createElement('template');t.innerHTML=await r.text();const lists=()=>[...d.querySelectorAll('main ul.tasks')];let first;
+for(const u of t.content.querySelectorAll('ul.tasks')){for(const li of [...u.children])if(d.getElementById(li.id))li.remove();if(!u.children.length)continue;
+first??=u.firstElementChild;const cur=lists().find((x)=>x.dataset.group===u.dataset.group);
+if(cur){cur.append(...u.children);const n=cur.previousElementSibling?.querySelector('.n');if(n)n.textContent=cur.children.length;continue}
+const h=u.previousElementSibling?.matches('h2.group')?u.previousElementSibling:null,next=lists().find((x)=>+x.dataset.order>+u.dataset.order);
+const at=next?(next.previousElementSibling?.matches('h2.group')?next.previousElementSibling:next):nav;at.before(...(h?[h,u]:[u]))}
+nav.replaceWith(t.content.querySelector('.more')??'');history.replaceState(history.state,'',url);
+const shown=new URL(url,location.href).searchParams.get('shown');d.querySelectorAll('input[name=next]').forEach((i)=>{i.value=url});
+d.querySelectorAll('a[data-here]').forEach((x)=>{const v=new URL(x.href);v.searchParams.set('shown',shown);x.href=v.pathname+v.search});
+first?.querySelector('summary')?.focus()}catch{location.href=a.href}});})();`;
 
 export const SCRIPT_HASH = `'sha256-${createHash('sha256').update(SCRIPT).digest('base64')}'`;
 
