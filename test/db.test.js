@@ -6,16 +6,17 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { after, before, describe, test } from 'node:test';
 import { assertScoped, loadMigrations, planMigrations, runMigrations } from '../scripts/migrate.js';
-import { createPgStore, PG_POOL_OPTIONS, TOKEN_PAGE_SIZE } from '../src/db.js';
+import { createPgStore, MAX_BULK, PG_POOL_OPTIONS, TOKEN_PAGE_SIZE } from '../src/db.js';
+import { SCOPES } from '../src/admin.js';
 import { CATEGORIES, payloadHash } from '../src/mcp.js';
 import { generateToken, hashToken } from '../src/security.js';
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { call, env, serve } from './helpers.js';
 
-// The four authored migration files; every ledger assertion below derives from this list.
+// The five authored migration files; every ledger assertion below derives from this list.
 const EXPECTED = [['001', 'hindsight'], ['002', 'idempotency_review'], ['003', 'bounded_rate_limits'],
-  ['004', 'feedback_categories']];
+  ['004', 'feedback_categories'], ['005', 'admin_scope']];
 const VERSIONS = EXPECTED.map(([v]) => v);
 const NEW_CATEGORIES = ['instructions', 'skills', 'codebase', 'collaboration'];
 
@@ -57,6 +58,13 @@ test('004 category constraint matches CATEGORIES and keeps every old value', () 
   assert.deepEqual(allowed, CATEGORIES);
   for (const c of [...NEW_CATEGORIES, 'connector', 'tooling', 'environment', 'documentation', 'workflow',
     'performance', 'other']) assert.ok(allowed.includes(c), c);
+});
+
+test('005 scope constraint matches SCOPES and keeps feedback:submit', () => {
+  const sql = loadMigrations().find((m) => m.version === '005').sql;
+  const allowed = [...sql.match(/CHECK \(scope IN \(([^)]*)\)\)/)[1].matchAll(/'([a-z:]+)'/g)].map((x) => x[1]);
+  assert.deepEqual(allowed, SCOPES);
+  assert.deepEqual(SCOPES, ['feedback:submit', 'feedback:admin']);
 });
 
 const target = resolveTestDatabase();
@@ -151,19 +159,19 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       const schema = await migrated();
       const c = await schemaClient(schema);
       const base = loadMigrations();
-      // Fixture version is the next one after the real files, so it never collides with an authored migration.
-      const next = String(Number(base.at(-1).version) + 1).padStart(3, '0');
-      assert.equal(next, '005');
+      // Fixture version is far beyond the authored files, so it never collides with a real migration.
+      const next = '900';
+      assert.ok(base.every((m) => m.version < next));
       const bad = { version: next, name: 'bad', checksum: 'a'.repeat(64),
         sql: 'CREATE TABLE hindsight_probe (id int); SELECT 1/0;' };
       const good = { ...bad, checksum: 'b'.repeat(64), sql: 'CREATE TABLE hindsight_probe (id int);' };
       try {
-        await assert.rejects(runMigrations(c, { migrations: [...base, bad] }), /005_bad failed and was rolled back/);
+        await assert.rejects(runMigrations(c, { migrations: [...base, bad] }), /900_bad failed and was rolled back/);
         const { rows } = await c.query(`SELECT to_regclass('hindsight_probe') AS t,
           (SELECT count(*)::int FROM hindsight_schema_migrations) AS n`);
         assert.deepEqual(rows[0], { t: null, n: VERSIONS.length });
         assert.deepEqual(await runMigrations(c, { migrations: [...base, good] }),
-          { applied: ['005'], skipped: VERSIONS });
+          { applied: ['900'], skipped: VERSIONS });
       } finally { await c.end(); }
     });
 
@@ -177,12 +185,38 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
           RETURNING id`, [hashToken(generateToken())]);
         await c.query(`INSERT INTO hindsight_rate_limits (token_id, window_start, count) VALUES
           ($1, '2026-01-01T00:00Z', 5), ($1, '2026-01-01T00:01Z', 2), ($1, '2026-01-01T00:02Z', 7)`, [tok.id]);
-        assert.deepEqual((await runMigrations(c, { migrations: files })).applied, ['003', '004']);
+        assert.deepEqual((await runMigrations(c, { migrations: files })).applied, VERSIONS.slice(2));
         const { rows } = await c.query('SELECT window_start, count FROM hindsight_rate_limits');
         assert.equal(rows.length, 1);
         assert.equal(rows[0].window_start.toISOString(), '2026-01-01T00:02:00.000Z');
         assert.equal(rows[0].count, 7);
         await assert.rejects(c.query(`INSERT INTO hindsight_rate_limits VALUES ($1, now(), 1)`, [tok.id]), /duplicate key/);
+      } finally { await c.end(); }
+    });
+
+    test('005 keeps existing tokens and feedback valid, adds admin scope and review columns', async () => {
+      const files = loadMigrations();
+      const schema = await migrated({ migrations: files.filter((m) => m.version < '005') });
+      const c = await schemaClient(schema);
+      try {
+        const plaintext = generateToken();
+        const { rows: [tok] } = await c.query(`INSERT INTO hindsight_ingestion_tokens
+          (owner_email, name, client, token_hash, expires_at) VALUES ('o@example.com','n','c',$1, now() + interval '1 day')
+          RETURNING id`, [hashToken(plaintext)]);
+        await c.query(`INSERT INTO hindsight_feedback (token_id, owner_email, client, request_id, payload_hash, friction,
+          improvement, category, review_state, reviewed_at) VALUES ($1,'o@example.com','c','pre-005-0001',$2,'f','i','skills','actioned',now())`,
+        [tok.id, '0'.repeat(64)]);
+        await assert.rejects(c.query(`UPDATE hindsight_ingestion_tokens SET scope = 'feedback:admin'`), /check constraint/);
+        assert.deepEqual((await runMigrations(c, { migrations: files })).applied, ['005']);
+        const { rows: [t] } = await c.query('SELECT scope FROM hindsight_ingestion_tokens WHERE id = $1', [tok.id]);
+        assert.equal(t.scope, 'feedback:submit');
+        const { rows: [f] } = await c.query('SELECT review_state, review_note, actioned_at, dismissed_at FROM hindsight_feedback');
+        assert.deepEqual(f, { review_state: 'actioned', review_note: null, actioned_at: null, dismissed_at: null });
+        await c.query(`UPDATE hindsight_ingestion_tokens SET scope = 'feedback:admin'`);
+        await assert.rejects(c.query(`UPDATE hindsight_ingestion_tokens SET scope = 'feedback:all'`), /check constraint/);
+        await assert.rejects(c.query(`UPDATE hindsight_feedback SET review_note = ''`), /check constraint/);
+        await assert.rejects(c.query(`UPDATE hindsight_feedback SET review_note = repeat('x', 2001)`), /check constraint/);
+        await c.query(`UPDATE hindsight_feedback SET review_note = repeat('é', 2000)`);
       } finally { await c.end(); }
     });
   });
@@ -196,9 +230,9 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
     });
 
     const day = () => new Date(Date.now() + 86400000);
-    async function token(s, ownerEmail, client = 'claude-code') {
+    async function token(s, ownerEmail, client = 'claude-code', scope) {
       const plaintext = generateToken();
-      const id = await s.createToken({ ownerEmail, name: 'test', client, tokenHash: hashToken(plaintext), expiresAt: day() });
+      const id = await s.createToken({ ownerEmail, name: 'test', client, tokenHash: hashToken(plaintext), expiresAt: day(), scope });
       return { id, plaintext, auth: await s.authenticateIngestionToken(hashToken(plaintext)) };
     }
     const feedback = (requestId, extra = {}) => ({
@@ -417,6 +451,39 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       assert.equal(listed.nextCursor, null);
     });
 
+    test('inbox views: multi-state listing and owner-scoped per-state counts honour category and key filters', async () => {
+      const owner = 'views@example.com';
+      const laptop = await token(store, owner, 'laptop');
+      const codex = await token(store, owner, 'codex');
+      const other = await token(store, 'views-other@example.com', 'laptop');
+      const ids = [];
+      for (const [i, [t, category, state]] of [[laptop, 'skills', 'new'], [laptop, 'skills', 'triaged'], [codex, 'codebase', 'actioned'],
+        [codex, 'skills', 'dismissed'], [laptop, 'codebase', 'new']].entries()) {
+        const r = await submit(store, t.auth, feedback(`views-${i}-0001`, { category }));
+        ids.push(r.id);
+        if (state !== 'new') assert.equal(await store.setReviewState(owner, r.id, state), true);
+      }
+      for (let i = 0; i < 3; i += 1) await submit(store, other.auth, feedback(`views-other-${i}-01`));
+      const zero = { new: 0, triaged: 0, actioned: 0, dismissed: 0 };
+      assert.deepEqual(await store.countFeedback(owner), { new: 2, triaged: 1, actioned: 1, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback(owner, { category: 'skills' }), { ...zero, new: 1, triaged: 1, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback(owner, { client: 'codex' }), { ...zero, actioned: 1, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback(owner, { category: 'codebase', client: 'laptop' }), { ...zero, new: 1 });
+      assert.deepEqual(await store.countFeedback('nobody@example.com'), zero);
+      assert.deepEqual(await store.countFeedback('views-other@example.com'), { ...zero, new: 3 });
+      const open = (await store.listFeedback(owner, { states: ['new', 'triaged'] })).rows.map((r) => r.id);
+      assert.deepEqual(open.sort(), [ids[0], ids[1], ids[4]].sort());
+      assert.deepEqual((await store.listFeedback(owner, { states: ['actioned'], client: 'codex' })).rows.map((r) => r.id), [ids[2]]);
+      assert.equal((await store.listFeedback(owner, { states: ['dismissed'], category: 'codebase' })).rows.length, 0);
+      assert.equal((await store.listFeedback(owner, { state: 'triaged' })).rows.length, 1); // single state still works
+      assert.equal((await store.listFeedback(owner)).rows.length, 5);
+      // Bulk via the store the /review/bulk route reuses: only the owner's ids change.
+      const others = (await store.listFeedback('views-other@example.com')).rows.map((r) => r.id);
+      assert.deepEqual((await store.bulkSetReviewState(owner, [ids[0], ids[4], others[0]], 'actioned')).sort(), [ids[0], ids[4]].sort());
+      assert.deepEqual(await store.countFeedback(owner), { new: 0, triaged: 1, actioned: 3, dismissed: 1 });
+      assert.deepEqual(await store.countFeedback('views-other@example.com'), { ...zero, new: 3 });
+    });
+
     test('token keyset paging reaches and revokes the oldest of >100 tokens; cursors are owner-scoped', async () => {
       const owner = 'page@example.com';
       const intruder = 'intruder@example.com';
@@ -509,6 +576,202 @@ describe('durable storage (isolated test schema)', { skip: target.skip }, () => 
       assert.equal(results.filter((r) => r.status === 'replayed').length, 11);
       assert.equal(new Set(results.map((r) => r.id)).size, 1);
       assert.equal((await store.listFeedback(owner)).rows.length, 1);
+    });
+
+    test('admin and ingest tokens authenticate with their scope', async () => {
+      const owner = 'scope@example.com';
+      const ingest = await token(store, owner);
+      const admin = await token(store, owner, 'ops', 'feedback:admin');
+      assert.equal(ingest.auth.scope, 'feedback:submit');
+      assert.equal(admin.auth.scope, 'feedback:admin');
+      const combined = await store.authenticateAndRateLimit(hashToken(admin.plaintext), [owner], 20);
+      assert.equal(combined.allowed, true);
+      assert.equal(combined.token.scope, 'feedback:admin');
+      assert.deepEqual((await store.listTokens(owner)).rows.map((t) => t.scope).sort(), ['feedback:admin', 'feedback:submit']);
+      await assert.rejects(store.createToken({ ownerEmail: owner, name: 'x', client: 'x', tokenHash: hashToken(generateToken()),
+        expiresAt: day(), scope: 'feedback:all' }), /check constraint/);
+      await store.revokeToken(owner, admin.id);
+      assert.deepEqual(await store.authenticateAndRateLimit(hashToken(admin.plaintext), [owner], 20), { token: null, allowed: false });
+    });
+
+    test('admin feedback listing pages by owner-scoped keyset cursor and filters', async () => {
+      const owner = 'admin-page@example.com';
+      const intruder = 'admin-intruder@example.com';
+      const pool = schemaPool(schema);
+      const a = await token(store, owner, 'laptop');
+      const b = await token(store, owner, 'ci');
+      const ids = [];
+      for (let i = 0; i < 60; i += 1) {
+        const r = await submit(store, i % 3 ? a.auth : b.auth, feedback(`page-${String(i).padStart(4, '0')}`,
+          { category: i % 2 ? 'skills' : 'codebase' }));
+        ids.push(r.id);
+      }
+      // All but the oldest share created_at, so page boundaries rely on the id tiebreak.
+      await pool.query(`UPDATE hindsight_feedback SET created_at = CASE WHEN id = $2
+        THEN now() - interval '2 days' ELSE now() - interval '1 day' END WHERE owner_email = $1`, [owner, ids[0]]);
+      const theirs = await submit(store, (await token(store, intruder)).auth, feedback('page-intruder'));
+
+      const walk = async (filters, limit) => {
+        const seen = [];
+        const cursors = [];
+        let before;
+        do {
+          const { rows, nextCursor } = await store.listFeedbackPage(owner, { ...filters, before, limit });
+          assert.ok(rows.length <= limit);
+          seen.push(...rows.map((r) => r.id));
+          if (nextCursor) { assert.equal(nextCursor, rows.at(-1).id); cursors.push(nextCursor); }
+          before = nextCursor;
+          assert.ok(cursors.length <= 70, 'pagination must terminate');
+        } while (before);
+        return { seen, cursors };
+      };
+      const all = await walk({}, 7);
+      assert.equal(all.seen.length, 60);
+      assert.deepEqual([...all.seen].sort(), [...ids].sort());
+      assert.equal(all.seen.at(-1), ids[0]);
+      assert.equal(all.cursors.length, Math.ceil(60 / 7) - 1);
+
+      assert.equal((await walk({ client: 'ci' }, 25)).seen.length, 20);
+      assert.equal((await walk({ category: 'skills' }, 25)).seen.length, 30);
+      assert.equal((await walk({ category: 'skills', client: 'ci' }, 25)).seen.length, 10);
+      assert.equal(await store.bulkSetReviewState(owner, ids.slice(0, 5), 'triaged').then((r) => r.length), 5);
+      assert.deepEqual((await walk({ state: 'triaged' }, 2)).seen.sort(), ids.slice(0, 5).sort());
+
+      // Limits are clamped in storage too.
+      assert.equal((await store.listFeedbackPage(owner, { limit: 1000 })).rows.length, 60);
+      assert.equal((await store.listFeedbackPage(owner, { limit: 0 })).rows.length, 1);
+      // Cursors are owner-scoped: another owner's or an unknown id yields an empty page.
+      for (const c of all.cursors.slice(0, 3)) {
+        assert.deepEqual(await store.listFeedbackPage(intruder, { before: c }), { rows: [], nextCursor: null });
+      }
+      assert.deepEqual((await store.listFeedbackPage(intruder)).rows.map((r) => r.id), [theirs.id]);
+      assert.deepEqual(await store.listFeedbackPage(owner, { before: theirs.id }), { rows: [], nextCursor: null });
+      assert.deepEqual(await store.listFeedbackPage(owner, { before: '00000000-0000-4000-8000-000000000000' }),
+        { rows: [], nextCursor: null });
+      await assert.rejects(store.listFeedbackPage(owner, { before: 'not-a-uuid' }));
+    });
+
+    test('admin get, update, and bulk are owner-isolated; state timestamps and notes', async () => {
+      const owner = 'admin-update@example.com';
+      const other = 'admin-other@example.com';
+      const pool = schemaPool(schema);
+      const mine = await submit(store, (await token(store, owner)).auth, feedback('upd-00000001'));
+      const mine2 = await submit(store, (await token(store, owner)).auth, feedback('upd-00000002'));
+      const theirs = await submit(store, (await token(store, other)).auth, feedback('upd-00000001'));
+      const raw = async (id) => (await pool.query('SELECT * FROM hindsight_feedback WHERE id = $1', [id])).rows[0];
+
+      assert.equal((await store.getFeedback(owner, mine.id)).id, mine.id);
+      assert.equal(await store.getFeedback(owner, theirs.id), null);
+      assert.equal(await store.getFeedback(owner, '00000000-0000-4000-8000-000000000000'), null);
+      assert.equal(await store.updateFeedback(owner, theirs.id, { state: 'dismissed', note: 'x' }), null);
+      const untouched = await raw(theirs.id);
+      assert.deepEqual([untouched.review_state, untouched.review_note, untouched.reviewed_at], ['new', null, null]);
+
+      const actioned = await store.updateFeedback(owner, mine.id, { state: 'actioned' });
+      assert.equal(actioned.review_state, 'actioned');
+      assert.ok(actioned.reviewed_at && actioned.actioned_at);
+      assert.equal(actioned.dismissed_at, null);
+      await pool.query(`UPDATE hindsight_feedback SET actioned_at = now() - interval '1 hour',
+        reviewed_at = now() - interval '1 hour' WHERE id = $1`, [mine.id]);
+      const before = await raw(mine.id);
+      const again = await store.updateFeedback(owner, mine.id, { state: 'actioned' });
+      assert.equal(again.actioned_at.getTime(), before.actioned_at.getTime()); // re-setting keeps entry time
+      assert.ok(again.reviewed_at > before.reviewed_at);
+      const triaged = await store.updateFeedback(owner, mine.id, { state: 'triaged', note: 'Fixed in skills repo' });
+      assert.equal(triaged.actioned_at.getTime(), before.actioned_at.getTime()); // history kept
+      assert.equal(triaged.review_note, 'Fixed in skills repo');
+      const noteOnly = await store.updateFeedback(owner, mine.id, { note: 'Second thoughts' });
+      assert.deepEqual([noteOnly.review_state, noteOnly.review_note], ['triaged', 'Second thoughts']);
+      assert.equal(noteOnly.reviewed_at.getTime(), triaged.reviewed_at.getTime()); // note alone is not a state change
+      assert.equal((await store.updateFeedback(owner, mine.id, { state: 'new' })).review_note, 'Second thoughts');
+      assert.equal((await store.updateFeedback(owner, mine.id, { note: null })).review_note, null);
+      assert.equal(await store.setReviewState(owner, mine.id, 'dismissed'), true);
+      assert.ok((await raw(mine.id)).dismissed_at);
+      assert.equal(await store.setReviewState(other, mine.id, 'new'), false);
+      // Submitted evidence is never changed by review updates.
+      assert.equal((await raw(mine.id)).friction, feedback('x').friction);
+
+      const unknown = '00000000-0000-4000-8000-000000000000';
+      const updated = await store.bulkSetReviewState(owner, [mine.id, mine2.id, theirs.id, unknown], 'actioned');
+      assert.deepEqual(updated.sort(), [mine.id, mine2.id].sort());
+      assert.equal((await raw(theirs.id)).review_state, 'new');
+      assert.ok((await raw(mine2.id)).actioned_at);
+      assert.deepEqual(await store.bulkSetReviewState(other, [mine.id], 'new'), []);
+      assert.equal((await raw(mine.id)).review_state, 'actioned');
+      await assert.rejects(store.bulkSetReviewState(owner, Array(MAX_BULK + 1).fill(mine.id), 'new'), /bulk_limit/);
+      await assert.rejects(store.bulkSetReviewState(owner, [mine.id], 'deleted'), /check constraint/);
+    });
+
+    test('REST and MCP admin surfaces over real storage: scope, isolation, revocation, removed owner', async () => {
+      const owner = 'owner@example.com';
+      const pool = schemaPool(schema);
+      const admin = await token(store, owner, 'ops', 'feedback:admin');
+      const ingest = await token(store, owner, 'laptop');
+      const mine = await submit(store, ingest.auth, feedback('rest-00000001'));
+      const theirs = await submit(store, (await token(store, 'stranger@example.com')).auth, feedback('rest-00000001'));
+      await pool.query('UPDATE hindsight_ingestion_tokens SET name = client'); // UI-created keys: name == client
+      const config = loadConfig({ ...env, HINDSIGHT_RATE_LIMIT_PER_MINUTE: '600' });
+      const app = createApp({ config, store, getReviewer: async () => null, authRouter: (_req, res) => res.status(404).end() });
+      const auth = (t) => ({ authorization: 'Bearer ' + t.plaintext });
+      const json = { 'content-type': 'application/json' };
+      const rpc = (t, body) => call(base, '/api/mcp', { method: 'POST', headers: { ...auth(t), ...json,
+        accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, ...body }) });
+      let base;
+      await serve(app, async (b) => {
+        base = b;
+        const list = await call(base, '/api/v1/feedback?key=laptop', { headers: auth(admin) });
+        assert.equal(list.status, 200);
+        const page = JSON.parse(list.body);
+        assert.deepEqual(page.items.map((i) => i.id), [mine.id]);
+        assert.equal(page.items[0].key, 'laptop');
+        assert.equal(page.next_cursor, null);
+        assert.equal((await call(base, `/api/v1/feedback/${theirs.id}`, { headers: auth(admin) })).status, 404);
+        const patched = await call(base, `/api/v1/feedback/${mine.id}`, { method: 'PATCH', headers: { ...auth(admin), ...json },
+          body: JSON.stringify({ state: 'actioned', review_note: '  done  ' }) });
+        assert.equal(patched.status, 200);
+        const item = JSON.parse(patched.body);
+        assert.deepEqual([item.state, item.review_note], ['actioned', 'done']);
+        assert.ok(item.actioned_at);
+        const foreign = await call(base, `/api/v1/feedback/${theirs.id}`, { method: 'PATCH', headers: { ...auth(admin), ...json },
+          body: JSON.stringify({ state: 'dismissed' }) });
+        assert.equal(foreign.status, 404);
+        const bulk = await call(base, '/api/v1/feedback/bulk', { method: 'POST', headers: { ...auth(admin), ...json },
+          body: JSON.stringify({ ids: [mine.id, theirs.id], state: 'triaged' }) });
+        assert.deepEqual(JSON.parse(bulk.body), { state: 'triaged', updated: [mine.id], not_found: [theirs.id] });
+        assert.equal((await pool.query('SELECT review_state FROM hindsight_feedback WHERE id = $1', [theirs.id])).rows[0].review_state, 'new');
+
+        // An ingest key is refused on every admin endpoint and keeps exactly one MCP tool.
+        assert.equal((await call(base, '/api/v1/feedback', { headers: auth(ingest) })).status, 403);
+        assert.equal((await call(base, `/api/v1/feedback/${mine.id}`, { method: 'PATCH', headers: { ...auth(ingest), ...json },
+          body: JSON.stringify({ state: 'new' }) })).status, 403);
+        const ingestTools = await rpc(ingest, { method: 'tools/list' });
+        assert.deepEqual([...ingestTools.body.toString().matchAll(/"name":"([a-z_]+)"/g)].map((m) => m[1]), ['submit_feedback']);
+        const adminTools = await rpc(admin, { method: 'tools/list' });
+        for (const name of ['submit_feedback', 'list_feedback', 'get_feedback', 'update_feedback_state', 'bulk_update_feedback_state']) {
+          assert.ok(adminTools.body.toString().includes(`"name":"${name}"`), name);
+        }
+        const got = await rpc(admin, { method: 'tools/call', params: { name: 'get_feedback', arguments: { id: mine.id } } });
+        assert.match(got.body.toString(), /triaged/);
+        const refused = await rpc(ingest, { method: 'tools/call', params: { name: 'get_feedback', arguments: { id: mine.id } } });
+        assert.doesNotMatch(refused.body.toString(), /triaged|Accept relative paths/);
+        // An admin key can also submit.
+        const sub = await rpc(admin, { method: 'tools/call', params: { name: 'submit_feedback', arguments: feedback('rest-00000002') } });
+        assert.match(sub.body.toString(), /Recorded feedback [0-9a-f-]{36} for ops/);
+
+        await store.revokeToken(owner, admin.id);
+        const revoked = await call(base, '/api/v1/feedback', { headers: auth(admin) });
+        assert.equal(revoked.status, 401);
+        assert.deepEqual(JSON.parse(revoked.body), { error: 'invalid_token' });
+      });
+      // A removed owner's admin key gets the same 401, before any throttle write.
+      const second = await token(store, owner, 'ops2', 'feedback:admin');
+      const removed = createApp({ config: loadConfig({ ...env, HINDSIGHT_REVIEWER_EMAILS: 'other@example.com' }), store,
+        getReviewer: async () => null, authRouter: (_req, res) => res.status(404).end() });
+      await serve(removed, async (b) => {
+        assert.equal((await call(b, '/api/v1/feedback', { headers: auth(second) })).status, 401);
+        assert.equal((await call(b, '/api/mcp', { method: 'POST', headers: auth(second) })).status, 401);
+      });
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM hindsight_rate_limits WHERE token_id = $1', [second.id])).rows[0].n, 0);
     });
 
     test('per-token bounded throttling across windows and concurrent requests', async () => {
