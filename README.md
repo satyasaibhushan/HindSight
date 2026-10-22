@@ -3,6 +3,22 @@
 A small Google-protected feedback review app plus API keys: submit-only **ingest** keys for MCP clients,
 and owner-scoped **admin** keys that can also read and triage that feedback over MCP or a small REST API.
 
+## Demo
+
+![The HindSight Inbox: an item expanded, one ticked done, the Done view, a new ingest key revealed, and the Connect page](docs/demo/demo.gif)
+
+The recording is the real app, booted on its in-memory test store with seeded fictional feedback and a fixed
+fictional reviewer (`scripts/demo.js`, see [Reproduce the demo](#reproduce-the-demo)). Still:
+[docs/demo/poster.png](docs/demo/poster.png). Video: [demo.webm](docs/demo/demo.webm), [demo.mp4](docs/demo/demo.mp4).
+
+Live at https://hindsight.bhushan.fun. Every page is owner-only behind Google sign-in; `/health` is the one public route.
+
+## Stack
+
+Node.js 24 ESM with no build step. Express 5, Auth.js (`@auth/express`) for Google sign-in, PostgreSQL through `pg`,
+the official MCP server package for `/api/mcp`, zod for input validation, and server-rendered HTML with one small
+inline script. On Vercel every path is rewritten to the single function in `api/index.js`.
+
 Its purpose: agents submit useful, concrete improvements to the user's editable shared project
 instructions, skills, codebase, and collaboration, as well as tools and connectors, so the user can
 review and act on them.
@@ -88,12 +104,14 @@ native `<details>` panel. Every control is a plain form POST or link, so the pag
   and every form's return path. The list stops at 1,025 items (the reach of the old pages 0–40) with a note to filter.
   Old `?page=p` links map to `shown=(p+1)*25`; `shown` wins if both are given.
 
-## Status: setup-required
+## Status and limitations
 
-Until Google, database, session, and reviewer configuration are supplied, every route except
-`/health` returns `503 setup_required`. That is intentional. Real configuration arrives tomorrow
-(see checklist). Real Google sign-in, the four MCP client configurations, and production persistence
-have **not** been tested end to end.
+- Deployed at https://hindsight.bhushan.fun; its `/health` reports `ok`.
+- Until Google, database, session, and reviewer configuration are supplied, every route except `/health`
+  returns `503 setup_required`. That is intentional.
+- One reviewer per allowlisted Google account; feedback and keys are owner-scoped, nothing is shared between owners.
+- There are no demo users, tokens, or auth-bypass switches in the app. The demo recording and screenshots come from
+  the dev-only harness in `scripts/`, which never touches a database.
 
 ## Requirements
 
@@ -123,9 +141,10 @@ the port. There are no demo users, tokens, or auth-bypass switches.
 - `test/app.test.js`, `test/mcp.test.js`, and the migration scope-guard test use in-memory stores
   and synthetic `.invalid` config; they need no database.
 - `node scripts/screenshots.js` regenerates `docs/screenshots/after/*.png`: it boots the real app on the in-memory test
-  store with synthetic config, a fixed signed-in reviewer, and seeded sample data, and captures it with Playwright
-  (desktop, 390px mobile, light and dark; `20`/`21` show the Inbox after "Show more"). Playwright is not a project dependency: it needs a local Playwright and
-  Chromium (`PLAYWRIGHT_MODULE` may point at its entry file). It never touches a database.
+  store with synthetic config, a fixed signed-in reviewer, and seeded sample data (`scripts/demo-app.js`), and captures
+  it with Playwright (desktop, 390px mobile, light and dark; `20`/`21` show the Inbox after "Show more"). Playwright is
+  not a project dependency: it needs a local Playwright and Chromium (`PLAYWRIGHT_MODULE` may point at its entry file).
+  It never touches a database.
 - `test/db.test.js` (migrations, persistence, category roundtrip and filtering, owner isolation,
   expiry/revocation, idempotency, throttling, token keyset paging over more than 100 tokens, admin scope,
   admin feedback paging/get/update/bulk, and the REST/MCP admin gate end to end) needs `HINDSIGHT_TEST_DATABASE_URL`. It never reads `DATABASE_URL` for connections and
@@ -138,6 +157,21 @@ the port. There are no demo users, tokens, or auth-bypass switches.
 ```sh
 HINDSIGHT_TEST_DATABASE_URL=postgres://user@localhost:5432/hindsight_test npm run test:db
 ```
+
+### Reproduce the demo
+
+`scripts/demo.js` records `docs/demo/` on the same harness as the screenshots: it starts the real app on the seeded
+in-memory store, drives one reviewer session (expand an item, tick one done, open the Done view, create an ingest
+key, open Connect) in a 1280×800 Chromium while Playwright records it, then writes `poster.png` and `demo.webm`.
+With `ffmpeg` on `PATH` it also writes `demo.mp4` and the README's `demo.gif`.
+
+```sh
+npm ci
+PLAYWRIGHT_MODULE=/path/to/node_modules/playwright/index.js node scripts/demo.js
+```
+
+Every name, email, repository, and request id in the recording is invented; the revealed key is generated by the
+in-memory store for that run and is never stored anywhere.
 
 ## Configuration
 
