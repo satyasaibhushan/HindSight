@@ -65,6 +65,7 @@ textarea{display:block;resize:vertical;line-height:1.45}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:var(--ring)}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-1)}
 .card-pad{padding:18px 20px}
+.demo{margin:0 0 20px;overflow:hidden}.demo video{display:block;width:100%;height:auto}.demo figcaption{padding:8px 14px}
 .stack>*+*{margin-top:16px}
 .toolbar{display:flex;align-items:center;gap:8px 16px;margin-bottom:10px;border-bottom:1px solid var(--border)}
 .toolbar>.btn{margin-left:auto;margin-bottom:4px}

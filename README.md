@@ -11,7 +11,8 @@ The recording is the real app, booted on its in-memory test store with seeded fi
 fictional reviewer (`scripts/demo.js`, see [Reproduce the demo](#reproduce-the-demo)). Still:
 [docs/demo/poster.png](docs/demo/poster.png). Video: [demo.webm](docs/demo/demo.webm), [demo.mp4](docs/demo/demo.mp4).
 
-Live at https://hindsight.bhushan.fun. Every page is owner-only behind Google sign-in; `/health` is the one public route.
+Live at https://hindsight.bhushan.fun. The product page at [`/about`](https://hindsight.bhushan.fun/about) is public and plays
+the same recording; every other page is owner-only behind Google sign-in, and `/health` is the only other public route.
 
 ## Stack
 
@@ -55,6 +56,9 @@ plus the retained `connector`, `tooling`, `environment`, `documentation`, `workf
 - `/connect` — copyable MCP setup for Claude Code, Codex CLI, Cursor, and OpenCode, filled in with this origin, plus a
   "Use an admin key" section (`/connect#admin`) with the admin MCP tools and `/api/v1` examples.
 - `/health` — reports `ok` or `setup-required`; no secrets.
+- `/about` — public product page with the demo recording, served from `docs/demo/` (`/about/demo.webm`, `demo.mp4`,
+  `poster.png`; `vercel.json` bundles that directory into the function). No session lookup or storage access; its CSP
+  adds `img-src 'self'` and `media-src 'self'`.
 
 All pages send `Content-Security-Policy` with `default-src 'none'`, `connect-src 'self'`, and `form-action 'self'`.
 The one exception is the sign-in page (`/auth/signin`), which also allows `https://accounts.google.com` so its Google

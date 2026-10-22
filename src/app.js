@@ -1,4 +1,5 @@
 import express from 'express';
+import { fileURLToPath } from 'node:url';
 import { MAX_BULK, MAX_NOTE, SCOPE_ADMIN, SCOPE_SUBMIT, SCOPES, bulkUpdate, isAdmin } from './admin.js';
 import { adminApi } from './api-v1.js';
 import { MAX_PAGE, MAX_SHOWN, PAGE_SIZE, REVIEW_STATES } from './db.js';
@@ -12,6 +13,23 @@ submit about your shared instructions, skills, codebase, collaboration, and tool
 <p>This deployment is not ready yet: sign-in, storage, and reviewer access have not all been configured. Until they are,
 sign-in, review, and feedback submission stay switched off.</p></div>
 <p class="fine">${icon('wrench')} Operators: follow the setup checklist in the project README.</p>`);
+
+// Public product page. The recording is docs/demo (scripts/demo.js); vercel.json bundles that directory into the
+// function, and only these three files are served from it.
+const DEMO_DIR = fileURLToPath(new URL('../docs/demo/', import.meta.url));
+const DEMO_FILES = new Set(['demo.webm', 'demo.mp4', 'poster.png']);
+const GITHUB_URL = 'https://github.com/satyasaibhushan/HindSight';
+const aboutPage = () => shell('HindSight', `<figure class="card demo"><video autoplay loop muted playsinline poster="/about/poster.png"
+aria-label="HindSight demo: an Inbox item expanded and ticked done, the Done view, a new ingest key revealed, and the Connect page">
+<source src="/about/demo.webm" type="video/webm"><source src="/about/demo.mp4" type="video/mp4"></video>
+<figcaption class="small muted">Recorded from the app with fictional feedback and a fictional reviewer.</figcaption></figure>
+<section class="card card-pad stack"><h2>What it does</h2><ul class="prose-left">
+<li>Agents call one MCP tool, <code>submit_feedback</code>, with a submit-only ingest key when they finish work.</li>
+<li>Each suggestion is a concrete change to instructions, skills, the codebase, collaboration, or tools, with the friction that prompted it.</li>
+<li>The owner works through them as an Inbox checklist behind Google sign-in: plan, won't do, mark done, a private note, or bulk changes.</li>
+<li>Owner-scoped admin keys read and triage the same feedback over MCP or a small REST API.</li></ul>
+<div class="actions"><a class="btn" href="/review">Open the app${icon('arrow')}</a><a class="btn btn-secondary" href="${GITHUB_URL}">GitHub</a></div></section>`,
+{ sub: 'A private inbox for the improvements your coding agents suggest, so you can review them and act.' });
 
 // The sign-in page's form POSTs to /auth/signin/google, which 302s to Google's authorization
 // endpoint; browsers apply form-action to that redirect. Only that page may target the exact Google
@@ -161,6 +179,15 @@ export function createApp({ config, store, getReviewer, authRouter, getAuthCsrf 
   const ui = (req, current, extra = {}) => ({ user: req.reviewer, current, ...extra });
 
   app.get('/', (_req, res) => res.redirect(303, '/review'));
+
+  // The only public pages besides /health: no session lookup, store access, or forms. Media is same-origin.
+  app.get('/about', (_req, res) => {
+    res.set('Content-Security-Policy', `${csp("'self'")}; img-src 'self'; media-src 'self'`).send(aboutPage());
+  });
+  app.get('/about/:file', (req, res, next) => {
+    if (!DEMO_FILES.has(req.params.file)) return next();
+    res.set('Cache-Control', 'public, max-age=3600').sendFile(req.params.file, { root: DEMO_DIR, cacheControl: false });
+  });
 
   // Return to the same filtered view, scrolled to the item (or to its note form).
   const NEXT = /^\/review(\?[A-Za-z0-9_.~%&=+-]*)?$/;

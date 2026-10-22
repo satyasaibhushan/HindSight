@@ -502,7 +502,7 @@ test('connect screen shows copyable client setup for the canonical endpoint', as
 
 test('the inline script on every page matches the CSP hash', async () => {
   await serve(app(fakeStore(), { getAuthCsrf: authCsrf }), async (base) => {
-    for (const path of ['/review', '/tokens', '/connect', '/auth/signout']) {
+    for (const path of ['/review', '/tokens', '/connect', '/auth/signout', '/about']) {
       const res = await call(base, path);
       const scripts = [...text(res).matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
       assert.equal(scripts.length, 1, path);
@@ -510,6 +510,39 @@ test('the inline script on every page matches the CSP hash', async () => {
       assert.ok(res.headers['content-security-policy'].includes(`script-src ${hash};`), path);
     }
   });
+});
+
+test('about page is public, store-free, and serves only the recorded demo media', async () => {
+  const store = fakeStore();
+  let sessionLookups = 0;
+  const getReviewer = async () => { sessionLookups += 1; return null; };
+  await serve(app(store, { getReviewer, config: loadConfig({ HINDSIGHT_PUBLIC_ORIGIN: ORIGIN }) }), async (base) => {
+    const page = await call(base, '/about');
+    assert.equal(page.status, 200);
+    assert.match(page.headers['content-security-policy'], /; img-src 'self'; media-src 'self'$/);
+    assert.match(page.headers['content-security-policy'], /form-action 'self'/);
+    const html = text(page);
+    for (const src of ['/about/poster.png', '/about/demo.webm', '/about/demo.mp4', 'https://github.com/satyasaibhushan/HindSight', 'href="/review"']) {
+      assert.ok(html.includes(src), src);
+    }
+    assert.ok(!html.includes('<form'));
+    for (const [file, type] of [['demo.webm', 'video/webm'], ['demo.mp4', 'video/mp4'], ['poster.png', 'image/png']]) {
+      const res = await call(base, '/about/' + file, { headers: { range: 'bytes=0-9' } });
+      assert.equal(res.status, 206, file);
+      assert.equal(res.headers['content-type'], type, file);
+      assert.equal(res.body.length, 10, file);
+      assert.equal(res.headers['cache-control'], 'public, max-age=3600', file);
+    }
+    for (const path of ['/about/demo.gif', '/about/..%2FREADME.md', '/about/%2e%2e%2fpackage.json', '/about/.env']) {
+      assert.equal((await call(base, path)).status, 404, path);
+    }
+    assert.equal((await call(base, '/about', { headers: { host: 'evil.test', 'x-forwarded-host': 'evil.test' } })).status, 421);
+    // Root and protected pages keep their behaviour.
+    assert.equal((await call(base, '/')).headers.location, '/review');
+    assert.equal((await call(base, '/review')).status, 503);
+  });
+  assert.deepEqual(store.calls, []);
+  assert.equal(sessionLookups, 0);
 });
 
 // ---- Admin keys: /api/v1 REST API, scope on /tokens, review notes.

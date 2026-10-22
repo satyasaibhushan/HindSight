@@ -1,5 +1,6 @@
 {
   "framework": null,
   "git": { "deploymentEnabled": { "stop-idle-mcp-work": false } },
+  "functions": { "api/index.js": { "includeFiles": "docs/demo/**" } },
   "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
 }
